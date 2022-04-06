@@ -1,0 +1,15 @@
+.gradle
+/local.properties
+.DS_Store
+/build
+/release
+bin
+out
+keys
+
+.idea
+*.iml
+tmp
+
+.password
+

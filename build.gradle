@@ -1,0 +1,117 @@
+group 'com.softwareverde'
+version '0.0.0'
+
+apply plugin: 'java'
+apply plugin: 'java-library'
+
+sourceCompatibility = 1.8
+
+sourceSets {
+    main {
+        java
+        resources
+    }
+    test {
+        java
+        resources
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven { url "https://jitpack.io" }
+}
+
+dependencies {
+    // implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+    implementation  group: 'com.github.softwareverde',  name: 'java-util',              version: 'v2.7.3'
+    implementation  group: 'com.github.softwareverde',  name: 'java-logging',           version: 'v2.3.0'
+    implementation  group: 'com.github.softwareverde',  name: 'bitcoin-verde',          version: 'v2.2.0'
+
+    testImplementation group: 'junit',                     name: 'junit',               version: '4.11'
+}
+
+task makeJar(type: Jar) {
+    manifest {
+        attributes  'Implementation-Title': 'Bitcoin Cash Scaling',
+                    'Implementation-Version': archiveVersion,
+                    'Main-Class': 'com.softwareverde.bitcoin.scaling.Main',
+                    'Class-Path': (project.configurations.compileClasspath + configurations.runtimeClasspath).collect { 'libs/' + it.getName() }.join(' ')
+    }
+
+    archiveBaseName = project.name
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    from sourceSets.main.output
+
+    with jar
+}
+
+task copyDependencies(type: Copy) {
+    from (configurations.compileClasspath + configurations.runtimeClasspath)
+    into "$buildDir/libs/libs"
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.withType(Javadoc) {
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+task sourcesJar(type: Jar, dependsOn: classes) {
+    archiveClassifier = 'sources'
+    from sourceSets.main.allSource
+}
+
+task javadocJar(type: Jar, dependsOn: javadoc) {
+    archiveClassifier = 'javadoc'
+    from javadoc.destinationDir
+}
+
+artifacts {
+    archives sourcesJar
+    archives javadocJar
+}
+
+allprojects {
+    configurations {
+        umljavadoc
+    }
+
+    dependencies {
+        umljavadoc 'org.umlgraph:umlgraph:5.6'
+    }
+
+    // Requires "dot".  `brew install graphviz`
+    task makeDocumentation(dependsOn: javadoc) {
+        setDescription('Generates Javadoc API documentation with UMLGraph diagrams')
+        setGroup(JavaBasePlugin.DOCUMENTATION_GROUP)
+
+        doLast {
+            def javaFilePath = file('src/main/java')
+            if (javaFilePath.exists()) {
+                ant.javadoc(classpath: (configurations.compileClasspath).asPath,
+                        sourcepath: file('src/main/java'),
+                        packagenames: '*',
+                        destdir: "${docsDir}/javadoc",
+                        private: 'true',
+                        docletpath: configurations.umljavadoc.asPath) {
+                    doclet(name: 'org.umlgraph.doclet.UmlGraphDoc') {
+                        param(name: '-inferrel')
+                        param(name: '-inferdep')
+                        param(name: '-qualify')
+                        param(name: '-postfixpackage')
+                        param(name: '-hide', value: 'java.*')
+                        param(name: '-collpackages', value: 'java.util.*')
+                        param(name: '-nodefontsize', value: '9')
+                        param(name: '-nodefontpackagesize', value: '7')
+                        param(name: '-link', value: 'http://java.sun.com/j2se/1.5.0/docs/guide/javadoc/doclet/spec')
+                        param(name: '-link', value: 'http://java.sun.com/j2se/1.5/docs/api')
+                    }
+                }
+            }
+        }
+    }
+}
