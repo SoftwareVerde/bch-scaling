@@ -6,6 +6,7 @@
 bin
 out
 keys
+data
 
 .idea
 *.iml
