@@ -6,7 +6,9 @@ import com.softwareverde.bitcoin.address.AddressInflater;
 import com.softwareverde.bitcoin.block.Block;
 import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
+import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
+import com.softwareverde.bitcoin.block.header.BlockHeaderInflater;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
 import com.softwareverde.bitcoin.block.header.difficulty.Difficulty;
 import com.softwareverde.bitcoin.block.validator.difficulty.DifficultyCalculator;
@@ -21,12 +23,16 @@ import com.softwareverde.bitcoin.rpc.MutableBlockTemplate;
 import com.softwareverde.bitcoin.rpc.RpcCredentials;
 import com.softwareverde.bitcoin.rpc.core.BitcoinCoreRpcConnector;
 import com.softwareverde.bitcoin.scaling.generate.rpc.PrivateTestNetBitcoinMiningRpcConnector;
-import com.softwareverde.bitcoin.secp256k1.privatekey.PrivateKeyDeflater;
 import com.softwareverde.bitcoin.server.database.BatchRunner;
+import com.softwareverde.bitcoin.server.main.BitcoinConstants;
 import com.softwareverde.bitcoin.stratum.BitcoinCoreStratumServer;
 import com.softwareverde.bitcoin.stratum.StratumServer;
 import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
 import com.softwareverde.bitcoin.transaction.Transaction;
+import com.softwareverde.bitcoin.transaction.TransactionDeflater;
+import com.softwareverde.bitcoin.transaction.TransactionInflater;
+import com.softwareverde.bitcoin.transaction.coinbase.CoinbaseTransaction;
+import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.Wallet;
 import com.softwareverde.concurrent.threadpool.CachedThreadPool;
@@ -46,19 +52,32 @@ import com.softwareverde.logging.Logger;
 import com.softwareverde.util.ByteUtil;
 import com.softwareverde.util.Container;
 import com.softwareverde.util.IoUtil;
+import com.softwareverde.util.StringUtil;
 import com.softwareverde.util.Util;
 import com.softwareverde.util.timer.MultiTimer;
 import com.softwareverde.util.timer.NanoTimer;
+import com.softwareverde.util.type.time.SystemTime;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Main {
+    protected static final Boolean SKIP_MINING = true;
+
     protected interface TransactionGenerator {
-        List<Transaction> getTransactions(Long blockHeight);
+        List<Transaction> getTransactions(Long blockHeight, List<BlockHeader> newBlockHeaders);
+    }
+
+    protected interface PrivateKeyGenerator {
+        PrivateKey getCoinbasePrivateKey(Long blockHeight);
     }
 
     public static void main(final String[] commandLineArguments) {
+        BitcoinConstants.setBlockMaxByteCount((int) (256L * ByteUtil.Unit.Si.MEGABYTES));
+
         Logger.setLog(LineNumberAnnotatedLog.getInstance());
         Logger.setLogLevel(LogLevel.DEBUG);
         Logger.setLogLevel("com.softwareverde.util", LogLevel.ERROR);
@@ -79,15 +98,23 @@ public class Main {
         return blockInflater.fromBytes(bytes);
     }
 
-//    protected PrivateKey _derivePrivateKey(final Long value) {
-//        final MutableByteArray bytes = new MutableByteArray(PrivateKey.KEY_BYTE_COUNT);
-//        final byte[] valueBytes = ByteUtil.longToBytes(value);
-//
-//        final int startIndex = (PrivateKey.KEY_BYTE_COUNT - valueBytes.length);
-//        bytes.setBytes(startIndex, valueBytes);
-//
-//        return PrivateKey.fromBytes(bytes);
-//    }
+    protected BlockHeader _loadBlockHeader(final Sha256Hash blockHash, final File blocksDirectory) {
+        final BlockHeaderInflater blockHeaderInflater = new BlockHeaderInflater();
+
+        final String blockHashString = blockHash.toString();
+        final File blockFile = new File(blocksDirectory, blockHashString);
+
+        try (final InputStream inputStream = new FileInputStream(blockFile)) {
+            final MutableByteArray buffer = new MutableByteArray(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT);
+            IoUtil.readBytesFromStream(inputStream, buffer.unwrap());
+
+            return blockHeaderInflater.fromBytes(buffer);
+        }
+        catch (final Exception exception) {
+            Logger.debug(exception);
+            return null;
+        }
+    }
 
     protected static PrivateKey derivePrivateKey(final Long blockHeight, final Long outputValue) {
         final MutableByteArray bytes = new MutableByteArray(PrivateKey.KEY_BYTE_COUNT);
@@ -101,124 +128,212 @@ public class Main {
         return PrivateKey.fromBytes(bytes);
     }
 
-    protected MutableList<BlockHeader> _generateBlocks(final PrivateKey privateKey, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks) {
-        return _generateBlocks(privateKey, blockCount, blocksDirectory, initBlocks, null);
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks) {
+        return _generateBlocks(privateKeyGenerator, blockCount, blocksDirectory, initBlocks, null);
     }
 
-    protected MutableList<BlockHeader> _generateBlocks(final PrivateKey privateKey, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
+    protected BlockTemplate _getBlockTemplate(final File blocksDirectory, final Sha256Hash previousBlockHash, final Long nextBlockHeight, final TransactionGenerator transactionGenerator, final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext, final List<BlockHeader> createdBlocks) {
+        final File templatesDirectory = new File(blocksDirectory, "templates");
+        if (! templatesDirectory.exists()) {
+            templatesDirectory.mkdirs();
+        }
+
+        final File templateFile = new File(templatesDirectory, nextBlockHeight.toString());
+        if (templateFile.exists()) {
+            Logger.debug("Using Template: " + templateFile.getPath());
+            final Block block;
+            {
+                final BlockInflater blockInflater = new BlockInflater();
+                final ByteArray bytes = ByteArray.wrap(IoUtil.getFileContents(templateFile));
+                block = blockInflater.fromBytes(bytes);
+            }
+
+            final MutableBlockTemplate blockTemplate = new MutableBlockTemplate();
+            blockTemplate.setBlockVersion(Block.VERSION);
+            blockTemplate.setDifficulty(block.getDifficulty());
+            blockTemplate.setPreviousBlockHash(previousBlockHash);
+            blockTemplate.setBlockHeight(nextBlockHeight);
+
+            final CoinbaseTransaction coinbaseTransaction = block.getCoinbaseTransaction();
+            blockTemplate.setCoinbaseAmount(coinbaseTransaction.getTotalOutputValue());
+
+            final Long blockTime = block.getTimestamp();
+            blockTemplate.setMinimumBlockTime(blockTime);
+            blockTemplate.setCurrentTime(blockTime);
+
+            boolean isCoinbase = true;
+            final List<Transaction> transactions = block.getTransactions();
+            for (final Transaction transaction : transactions) {
+                if (isCoinbase) {
+                    isCoinbase = false;
+                    continue;
+                }
+
+                blockTemplate.addTransaction(transaction, 0L, 0);
+            }
+
+            return blockTemplate;
+        }
+
+        final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight, createdBlocks) : new MutableList<>(0));
+        final BlockTemplate blockTemplate = _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+
+        try {
+            final Block block = blockTemplate.toBlock();
+
+            final BlockDeflater blockDeflater = new BlockDeflater();
+            final ByteArray blockBytes = blockDeflater.toBytes(block);
+            IoUtil.putFileContents(templateFile, blockBytes);
+        }
+        catch (final Exception exception) {
+            Logger.debug(exception);
+        }
+
+        return blockTemplate;
+    }
+
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
         final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext = new PrivateTestNetDifficultyCalculatorContext();
         difficultyCalculatorContext.addBlocks(initBlocks);
 
-        final Address address;
-        {
-            final AddressInflater addressInflater = new AddressInflater();
-            address = addressInflater.fromPrivateKey(privateKey, true);
-        }
+        final Container<BlockTemplate> blockTemplateContainer = new Container<>(null);
+        final BitcoinMiningRpcConnectorFactory rpcConnectorFactory = new BitcoinMiningRpcConnectorFactory() {
+            @Override
+            public BitcoinMiningRpcConnector newBitcoinMiningRpcConnector() {
+                return new PrivateTestNetBitcoinMiningRpcConnector(blockTemplateContainer);
+            }
+        };
 
-        final Container<BlockTemplate> blockTemplateContainer;
+        final AddressInflater addressInflater = new AddressInflater();
+        final BlockDeflater blockDeflater = new BlockDeflater();
+        final MasterInflater masterInflater = new CoreInflater();
+        final CachedThreadPool threadPool = new CachedThreadPool(32, 10000L);
+        final StratumServer stratumServer = new BitcoinCoreStratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater);
+
+
+        final int initBlockCount = initBlocks.getCount();
+        final BlockHeader lastInitBlock = initBlocks.get(initBlockCount - 1);
+        final MutableList<BlockHeader> createdBlocks = new MutableList<>(blockCount);
+
         {
             final int blocksCount = initBlocks.getCount();
             final BlockHeader previousBlock = initBlocks.get(blocksCount - 1);
             final Sha256Hash previousBlockHash = previousBlock.getHash();
 
             final Long nextBlockHeight = (long) blocksCount;
-            final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
-            final BlockTemplate blockTemplate = _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
-            blockTemplateContainer = new Container<>(blockTemplate);
+            // final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
+            blockTemplateContainer.value = _getBlockTemplate(blocksDirectory, previousBlockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, createdBlocks); // _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+
+            final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(nextBlockHeight);
+            final Address address = addressInflater.fromPrivateKey(privateKey, true);
+            stratumServer.setCoinbaseAddress(address);
         }
-
-        final BitcoinMiningRpcConnectorFactory rpcConnectorFactory = new BitcoinMiningRpcConnectorFactory() {
-            @Override
-            public BitcoinMiningRpcConnector newBitcoinMiningRpcConnector() {
-                synchronized (blockTemplateContainer) {
-                    return new PrivateTestNetBitcoinMiningRpcConnector(blockTemplateContainer.value);
-                }
-            }
-        };
-
-        final BlockDeflater blockDeflater = new BlockDeflater();
-        final MasterInflater masterInflater = new CoreInflater();
-        final CachedThreadPool threadPool = new CachedThreadPool(32, 10000L);
-        final StratumServer stratumServer = new BitcoinCoreStratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater);
 
         if (! blocksDirectory.exists()) { blocksDirectory.mkdirs(); }
 
-        final int initBlockCount = initBlocks.getCount();
-        final BlockHeader lastInitBlock = initBlocks.get(initBlockCount - 1);
-        final MutableList<BlockHeader> blocks = new MutableList<>(blockCount);
-
-        stratumServer.setBlockFoundCallback(new BlockFoundCallback() {
+        final BlockFoundCallback blockFoundCallback = new BlockFoundCallback() {
             @Override
             public synchronized void run(final Block block, final String workerName) {
-                synchronized (blockTemplateContainer) {
-                    final int existingBlockCount;
-                    final BlockHeader previousBlock;
-                    synchronized (blocks) {
-                        existingBlockCount = blocks.getCount();
-                        if (existingBlockCount >= blockCount) {
-                            blocks.notifyAll();
-                            Logger.debug("DONE");
-                            return;
-                        }
+                blockTemplateContainer.value = null;
 
-                        Logger.debug("existingBlockCount=" + existingBlockCount);
-                        previousBlock = ((existingBlockCount < 1) ? lastInitBlock : blocks.get(existingBlockCount - 1));
-                    }
-                    Logger.debug("previousBlock=" + previousBlock.getHash());
-
-                    final Sha256Hash blockHash = block.getHash();
-                    {
-                        final Sha256Hash expectedPreviousBlockHash = previousBlock.getHash();
-                        final Sha256Hash previousBlockHash = block.getPreviousBlockHash();
-
-                        if (! Util.areEqual(expectedPreviousBlockHash, previousBlockHash)) {
-                            Logger.debug("Rejected: " + blockHash + " " + expectedPreviousBlockHash + " != " + previousBlockHash);
-                            return;
-                        }
+                final int createdBlockCount;
+                final BlockHeader lastCreatedBlock;
+                synchronized (createdBlocks) {
+                    createdBlockCount = createdBlocks.getCount();
+                    if (createdBlockCount >= blockCount) {
+                        createdBlocks.notifyAll();
+                        return;
                     }
 
-                    final ByteArray blockBytes = blockDeflater.toBytes(block);
-
-                    final File file = new File(blocksDirectory, blockHash.toString());
-                    IoUtil.putFileContents(file, blockBytes);
-
-                    final BlockHeader blockHeader = new ImmutableBlockHeader(block);
-                    synchronized (blocks) {
-                        blocks.add(blockHeader);
-                    }
-                    difficultyCalculatorContext.addBlock(blockHeader);
-
-                    final long blockHeight = ( (initBlockCount - 1) + (existingBlockCount + 1) );
-                    Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath());
-
-                    _sendBlock(block);
-
-                    if (blocks.getCount() >= blockCount) {
-                        synchronized (blocks) {
-                            blocks.notifyAll();
-                            return;
-                        }
-                    }
-
-                    final long nextBlockHeight = (blockHeight + 1L);
-                    final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
-                    blockTemplateContainer.value = _createBlockTemplate(blockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+                    lastCreatedBlock = ((createdBlockCount < 1) ? lastInitBlock : createdBlocks.get(createdBlockCount - 1));
                 }
+
+                final Sha256Hash blockHash = block.getHash();
+                {
+                    final Sha256Hash expectedPreviousBlockHash = lastCreatedBlock.getHash();
+                    final Sha256Hash previousBlockHash = block.getPreviousBlockHash();
+
+                    if (! Util.areEqual(expectedPreviousBlockHash, previousBlockHash)) {
+                        Logger.debug("Rejected: " + blockHash + " " + expectedPreviousBlockHash + " != " + previousBlockHash);
+                        return;
+                    }
+                }
+
+                final ByteArray blockBytes = blockDeflater.toBytes(block);
+
+                final File file = new File(blocksDirectory, blockHash.toString());
+                IoUtil.putFileContents(file, blockBytes);
+
+                final BlockHeader blockHeader = new ImmutableBlockHeader(block);
+                synchronized (createdBlocks) {
+                    createdBlocks.add(blockHeader);
+                }
+                difficultyCalculatorContext.addBlock(blockHeader);
+
+                final long blockHeight = ( (initBlockCount - 1) + (createdBlockCount + 1) );
+                Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath());
+
+                _sendBlock(block);
+
+                if (createdBlocks.getCount() >= blockCount) {
+                    synchronized (createdBlocks) {
+                        createdBlocks.notifyAll();
+                        return;
+                    }
+                }
+
+                final long nextBlockHeight = (blockHeight + 1L);
+                // final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
+                blockTemplateContainer.value = _getBlockTemplate(blocksDirectory, blockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, createdBlocks); // _createBlockTemplate(blockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+                synchronized (blockTemplateContainer) {
+                    blockTemplateContainer.notifyAll();
+                }
+
+                final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(nextBlockHeight);
+                final Address address = addressInflater.fromPrivateKey(privateKey, true);
+                stratumServer.setCoinbaseAddress(address);
             }
-        });
-        stratumServer.setCoinbaseAddress(address);
+        };
+
+        if (SKIP_MINING) {
+            while (true) {
+                final Long blockHeight = blockTemplateContainer.value.getBlockHeight();
+                final MutableBlock block = blockTemplateContainer.value.toBlock();
+                {
+                    final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(blockHeight);
+                    final Address address = addressInflater.fromPrivateKey(privateKey, true);
+
+                    final TransactionInflater transactionInflater = new TransactionInflater();
+
+                    final Transaction dummyCoinbaseTransaction = block.getCoinbaseTransaction();
+                    final Long amount = dummyCoinbaseTransaction.getTotalOutputValue();
+                    final Transaction coinbaseTransaction = transactionInflater.createCoinbaseTransaction(blockHeight, "", address, amount);
+
+                    block.replaceTransaction(0, coinbaseTransaction);
+                }
+
+                blockFoundCallback.run(block, "");
+                if (blockTemplateContainer.value == null) { break; }
+
+                final Long newBlockHeight = blockTemplateContainer.value.getBlockHeight();
+                if (Util.areEqual(blockHeight, newBlockHeight)) { break; }
+            }
+            return createdBlocks;
+        }
+
+        stratumServer.setBlockFoundCallback(blockFoundCallback);
 
         threadPool.start();
         stratumServer.start();
 
         int createdBlockCount = 0;
         while (createdBlockCount < blockCount) {
-            synchronized (blocks) {
+            synchronized (createdBlocks) {
                 try {
-                    blocks.wait();
+                    createdBlocks.wait();
                 }
                 catch (final Exception exception) { break; }
-                createdBlockCount = blocks.getCount();
+                createdBlockCount = createdBlocks.getCount();
             }
         }
 
@@ -227,58 +342,14 @@ public class Main {
 
         Logger.debug("Generated " + createdBlockCount + " blocks.");
 
-        return blocks;
+        return createdBlocks;
     }
 
     protected MutableList<BlockHeader> _loadInitBlocks(final File blocksBaseDirectory) {
-//        final Sha256Hash genesisBlockHash = Sha256Hash.fromHexString(BitcoinConstants.MainNet.genesisBlockHash);
-//
-//        Sha256Hash lastLoadedBlockHash = null;
-//        for (int i = 0; i < 3; ++i) {
-//            final File blocksDirectory = new File(blocksBaseDirectory, String.valueOf(i));
-//            if (! blocksDirectory.isDirectory()) { break; }
-//
-//            final File[] blocksDirectoryList = blocksDirectory.listFiles();
-//            if (blocksDirectoryList == null) { break; }
-//
-//            final HashMap<Sha256Hash, Block> previousBlockHashMap = new HashMap<>();
-//
-//            final BlockInflater blockInflater = new BlockInflater();
-//            for (final File blockFile : blocksDirectoryList) {
-//                final ByteArray blockData = ByteArray.wrap(IoUtil.getFileContents(blockFile));
-//                final Block block = blockInflater.fromBytes(blockData);
-//                if (block == null) { continue; }
-//
-//                // If the genesis block hasn't been loaded, add it to the list when it appears.
-//                if (lastLoadedBlockHash == null) {
-//                    final Sha256Hash blockHash = block.getHash();
-//                    if (Util.areEqual(blockHash, genesisBlockHash)) {
-//                        _blocks.add(block);
-//                        lastLoadedBlockHash = genesisBlockHash;
-//
-//                        _sendBlock(block);
-//                    }
-//                }
-//
-//                final Sha256Hash previousBlockHash = block.getPreviousBlockHash();
-//                previousBlockHashMap.put(previousBlockHash, block);
-//            }
-//
-//            while (true) {
-//                final Block block = previousBlockHashMap.get(lastLoadedBlockHash);
-//                if (block == null) { break; }
-//
-//                _blocks.add(block);
-//                lastLoadedBlockHash = block.getHash();
-//
-//                _sendBlock(block);
-//            }
-//        }
-
         final MutableList<BlockHeader> initBlocks = new MutableList<>();
 
         final BlockInflater blockInflater = new BlockInflater();
-        final Json mainNetBlocks = Json.parse(IoUtil.getResource("/block-hashes.json")); // Genesis through Block #144 (inclusive)
+        final Json mainNetBlocks = Json.parse(IoUtil.getResource("/manifest.json")); // Genesis through Block #144 (inclusive)
         for (int i = 0; i < mainNetBlocks.length(); ++i) {
             final String blockHash = mainNetBlocks.getString(i);
             final File blockDirectory = new File(blocksBaseDirectory, blockHash);
@@ -319,6 +390,8 @@ public class Main {
     public Main() { }
 
     protected BlockTemplate _createBlockTemplate(final Sha256Hash previousBlockHash, final Long blockHeight, final List<Transaction> transactions, final DifficultyCalculatorContext difficultyCalculatorContext) {
+        final SystemTime systemTime = new SystemTime();
+
         final DifficultyCalculator difficultyCalculator = new DifficultyCalculator(difficultyCalculatorContext);
 
         final Difficulty difficulty = difficultyCalculator.calculateRequiredDifficulty(blockHeight);
@@ -332,6 +405,10 @@ public class Main {
         blockTemplate.setBlockHeight(blockHeight);
         blockTemplate.setCoinbaseAmount(coinbaseReward);
 
+        final Long blockTime = systemTime.getCurrentTimeInSeconds();
+        blockTemplate.setMinimumBlockTime(blockTime);
+        blockTemplate.setCurrentTime(blockTime);
+
         for (final Transaction transaction : transactions) {
             blockTemplate.addTransaction(transaction, 0L, 0);
         }
@@ -340,9 +417,12 @@ public class Main {
     }
 
     protected void _sendBlock(final Block block) {
+        Logger.debug("Sending: " + block.getHash());
+        if (SKIP_MINING) { return; }
+
         final boolean isBitcoinVerdeNode = false;
         if (isBitcoinVerdeNode) {
-            final BitcoinNodeRpcAddress bitcoinNodeRpcAddress = new BitcoinNodeRpcAddress("localhost", 8334);
+            final BitcoinNodeRpcAddress bitcoinNodeRpcAddress = new BitcoinNodeRpcAddress("localhost", 18334);
             try (final BitcoinVerdeRpcConnector bitcoinRpcConnector = new BitcoinVerdeRpcConnector(bitcoinNodeRpcAddress, null)) {
                 bitcoinRpcConnector.submitBlock(block);
             }
@@ -358,6 +438,7 @@ public class Main {
                 bitcoinRpcConnector.submitBlock(block);
             }
         }
+        Logger.debug("Sent: " + block.getHash());
     }
 
     protected MutableList<Transaction> _createFanOutTransactions(final Transaction rootTransactionToSpend, final PrivateKey privateKey, final Long blockHeight) throws Exception {
@@ -439,68 +520,343 @@ public class Main {
         return new MutableList<>(transactions);
     }
 
+    protected static class TransactionWithBlockHeight {
+        public final Transaction transaction;
+        public final Long blockHeight;
+
+        public TransactionWithBlockHeight(final Transaction transaction, final Long blockHeight) {
+            this.transaction = transaction;
+            this.blockHeight = blockHeight;
+        }
+    }
+
+    protected MutableList<Transaction> _createFanInTransactions(final List<TransactionWithBlockHeight> transactionsToSpend, final Long blockHeight) throws Exception {
+        final Long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
+
+        final AddressInflater addressInflater = new AddressInflater();
+
+        final NanoTimer nanoTimer = new NanoTimer();
+
+        nanoTimer.start();
+        final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
+
+        final TransactionDeflater transactionDeflater = new TransactionDeflater();
+        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT);
+
+        final int batchSize = 32;
+        final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
+        batchRunner.run(transactionsToSpend, new BatchRunner.Batch<>() {
+            @Override
+            public void run(final List<TransactionWithBlockHeight> batchItems) throws Exception {
+                if (blockSize.get() >= maxBlockSize) { return; }
+
+                final NanoTimer nanoTimer = new NanoTimer();
+                nanoTimer.start();
+
+                final Wallet wallet = new Wallet();
+
+                int outputsToSpendCount = 0;
+                for (final TransactionWithBlockHeight transactionWithBlockHeight : batchItems) {
+                    for (final TransactionOutput transactionOutput : transactionWithBlockHeight.transaction.getTransactionOutputs()) {
+                        final Long amount = transactionOutput.getAmount();
+                        final PrivateKey privateKey = Main.derivePrivateKey(transactionWithBlockHeight.blockHeight, amount);
+                        wallet.addPrivateKey(privateKey);
+
+                        outputsToSpendCount += 1;
+                    }
+                    wallet.addTransaction(transactionWithBlockHeight.transaction);
+                }
+
+                final Long amount = wallet.getBalance();
+                final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount);
+                final Address address = addressInflater.fromPrivateKey(privateKey, true);
+
+                final Long fees = 0L; // wallet.calculateFees(1, outputsToSpendCount);
+                wallet.setSatoshisPerByteFee(0D);
+
+                final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
+                paymentAmounts.add(new PaymentAmount(address, amount - fees));
+
+                final Transaction transaction = wallet.createTransaction(paymentAmounts, address);
+                if (transaction == null) {
+                    Logger.debug("Unable to create transaction.");
+                    return;
+                }
+
+                final Integer byteCount = transactionDeflater.getByteCount(transaction);
+                final long newBlockSize = blockSize.addAndGet(byteCount);
+                if (newBlockSize >= maxBlockSize) { return; }
+
+                transactions.add(transaction);
+
+                nanoTimer.stop();
+                // Logger.debug("Spent " + batchItems.getCount() + " transactions in " + nanoTimer.getMillisecondsElapsed() + "ms.");
+            }
+        });
+
+        return new MutableList<>(transactions);
+    }
+
+    protected MutableList<Transaction> _createSteadyStateTransactions(final List<TransactionWithBlockHeight> transactionsToSpend, final Long blockHeight) throws Exception {
+        final Long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
+
+        final AddressInflater addressInflater = new AddressInflater();
+
+        final NanoTimer nanoTimer = new NanoTimer();
+
+        nanoTimer.start();
+        final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
+
+        final TransactionDeflater transactionDeflater = new TransactionDeflater();
+        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT);
+
+        final int batchSize = 128;
+        final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
+        batchRunner.run(transactionsToSpend, new BatchRunner.Batch<>() {
+            @Override
+            public void run(final List<TransactionWithBlockHeight> batchItems) throws Exception {
+                if (blockSize.get() >= maxBlockSize) { return; }
+
+                final NanoTimer nanoTimer = new NanoTimer();
+                nanoTimer.start();
+
+                int outputsToSpendCount = 0;
+                for (final TransactionWithBlockHeight transactionWithBlockHeight : batchItems) {
+                    final Wallet wallet = new Wallet();
+
+                    for (final TransactionOutput transactionOutput : transactionWithBlockHeight.transaction.getTransactionOutputs()) {
+                        final Long amount = transactionOutput.getAmount();
+                        final PrivateKey privateKey = Main.derivePrivateKey(transactionWithBlockHeight.blockHeight, amount);
+                        wallet.addPrivateKey(privateKey);
+
+                        outputsToSpendCount += 1;
+                    }
+                    wallet.addTransaction(transactionWithBlockHeight.transaction);
+
+                    final Long fee = 500L;
+
+                    final Long amount = wallet.getBalance();
+                    final Long amount0 = (amount / 2L);
+                    final Long amount1 = (amount - amount0 - fee);
+
+                    if (amount1 < 1L) { continue; }
+
+                    final Address changeAddress;
+                    final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
+                    {
+                        final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount0);
+                        final Address address = addressInflater.fromPrivateKey(privateKey, true);
+
+                        paymentAmounts.add(new PaymentAmount(address, amount0));
+                    }
+                    {
+                        final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount1);
+                        final Address address = addressInflater.fromPrivateKey(privateKey, true);
+
+                        paymentAmounts.add(new PaymentAmount(address, amount1));
+                        changeAddress = address;
+                    }
+
+                    final Transaction transaction = wallet.createTransaction(paymentAmounts, changeAddress);
+                    if (transaction == null) { break; }
+
+                    final Integer byteCount = transactionDeflater.getByteCount(transaction);
+                    final long newBlockSize = blockSize.addAndGet(byteCount);
+                    if (newBlockSize >= maxBlockSize) { return; }
+
+                    transactions.add(transaction);
+
+                    nanoTimer.stop();
+                }
+            }
+        });
+
+        return new MutableList<>(transactions);
+    }
+
     public void run() {
         final Integer coinbaseMaturityBlockCount = 100;
 
         final MutableList<BlockHeader> blockHeaders = new MutableList<>(0);
-        Logger.debug("blockHeaders.count = " + blockHeaders.getCount());
 
         final File blocksBaseDirectory = new File("data/blocks");
         final List<BlockHeader> initBlocks = _loadInitBlocks(blocksBaseDirectory);
         blockHeaders.addAll(initBlocks);
-        Logger.debug("blockHeaders.count = " + blockHeaders.getCount());
 
-        final Long firstScenarioBlockHeight = (long) blockHeaders.getCount();
-        final PrivateKey privateKey = Main.derivePrivateKey(firstScenarioBlockHeight, 0L);
-
-        final File defaultScenarioDirectory = new File("data/blocks/default");
-        final MutableList<BlockHeader> scenarioBlocks = _generateBlocks(privateKey, coinbaseMaturityBlockCount, defaultScenarioDirectory, blockHeaders);
-        blockHeaders.addAll(scenarioBlocks);
-        Logger.debug("blockHeaders.count = " + blockHeaders.getCount());
-
-        final List<BlockHeader> fanOutBlocks = _generateBlocks(privateKey, 1, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+        final PrivateKeyGenerator privateKeyGenerator = new PrivateKeyGenerator() {
             @Override
-            public List<Transaction> getTransactions(final Long blockHeight) {
-                final long coinbaseToSpendBlockHeight = (blockHeight - coinbaseMaturityBlockCount); // preFanOutBlock...
-                Logger.debug("coinbaseToSpendBlockHeight=" + coinbaseToSpendBlockHeight);
-                final BlockHeader blockHeader = blockHeaders.get((int) coinbaseToSpendBlockHeight);
-                final Block block = _loadBlock(blockHeader.getHash(), defaultScenarioDirectory);
-
-                final Transaction transactionToSplit = block.getCoinbaseTransaction();
-
-                final Wallet wallet = new Wallet();
-                wallet.addPrivateKey(privateKey);
-                wallet.addTransaction(transactionToSplit);
-                wallet.setSatoshisPerByteFee(0D);
-
-                final Address address = wallet.getReceivingAddress();
-                final Long totalOutputValue = transactionToSplit.getTotalOutputValue();
-
-                final int outputCount = 4;
-                final Long outputValue = (totalOutputValue / outputCount);
-                final MutableList<PaymentAmount> paymentAmounts = new MutableList<>(outputCount);
-                for (int i = 0; i < outputCount; ++i) {
-                    paymentAmounts.add(new PaymentAmount(address, outputValue));
-                }
-
-                final Transaction transaction = wallet.createTransaction(paymentAmounts, address);
-
-                try {
-                    final MutableList<Transaction> transactions = _createFanOutTransactions(transaction, privateKey, blockHeight);
-                    transactions.add(transaction);
-                    return transactions;
-                }
-                catch (final Exception exception) {
-                    Logger.warn(exception);
-                    return null;
-                }
+            public PrivateKey getCoinbasePrivateKey(final Long blockHeight) {
+                return Main.derivePrivateKey(blockHeight, 50L * Transaction.SATOSHIS_PER_BITCOIN);
             }
-        });
-        blockHeaders.addAll(fanOutBlocks);
-        Logger.debug("blockHeaders.count = " + blockHeaders.getCount());
+        };
 
-        final PrivateKeyDeflater privateKeyDeflater = new PrivateKeyDeflater();
-        final String privateKeyWif = privateKeyDeflater.toWalletImportFormat(privateKey, true);
-        System.out.println("Private Key: " + privateKeyWif);
+        final File defaultScenarioDirectory = new File(blocksBaseDirectory, "default");
+        final File manifestFile = new File(defaultScenarioDirectory, "manifest.json");
+        if (manifestFile.exists()) {
+            final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+            for (int i = 0; i < blocksManifestJson.length(); ++i) {
+                final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
+
+                final Block block = _loadBlock(blockHash, defaultScenarioDirectory);
+                _sendBlock(block);
+
+                final BlockHeader blockHeader = new ImmutableBlockHeader(block);
+                blockHeaders.add(blockHeader);
+            }
+        }
+        else {
+            final Json manifestJson = new Json(true);
+
+            Logger.info("Generating spendable coinbase blocks.");
+            final Long firstScenarioBlockHeight = (long) blockHeaders.getCount();
+            final MutableList<BlockHeader> scenarioBlocks = _generateBlocks(privateKeyGenerator, coinbaseMaturityBlockCount, defaultScenarioDirectory, blockHeaders);
+            blockHeaders.addAll(scenarioBlocks);
+            for (final BlockHeader blockHeader : scenarioBlocks) {
+                final Sha256Hash blockHash = blockHeader.getHash();
+                manifestJson.add(blockHash);
+            }
+
+            Logger.info("Generating fan-out blocks.");
+            final Long firstFanOutBlockHeight = (long) blockHeaders.getCount();
+            final List<BlockHeader> fanOutBlocks = _generateBlocks(privateKeyGenerator, 10, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+                @Override
+                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
+                    final long coinbaseToSpendBlockHeight = (blockHeight - coinbaseMaturityBlockCount); // preFanOutBlock...
+                    final BlockHeader blockHeader = blockHeaders.get((int) coinbaseToSpendBlockHeight);
+                    final Block block = _loadBlock(blockHeader.getHash(), defaultScenarioDirectory);
+
+                    final Transaction transactionToSplit = block.getCoinbaseTransaction();
+                    final PrivateKey coinbasePrivateKey = privateKeyGenerator.getCoinbasePrivateKey(coinbaseToSpendBlockHeight);
+
+                    // Spend the coinbase
+                    final Transaction transaction;
+                    final PrivateKey transactionPrivateKey;
+                    {
+
+                        final Wallet wallet = new Wallet();
+                        wallet.addPrivateKey(coinbasePrivateKey);
+                        wallet.addTransaction(transactionToSplit);
+                        wallet.setSatoshisPerByteFee(0D);
+
+                        final Address address = wallet.getReceivingAddress();
+                        final Long totalOutputValue = transactionToSplit.getTotalOutputValue();
+
+                        final int outputCount = 4;
+                        final Long outputValue = (totalOutputValue / outputCount);
+                        final MutableList<PaymentAmount> paymentAmounts = new MutableList<>(outputCount);
+                        for (int i = 0; i < outputCount; ++i) {
+                            paymentAmounts.add(new PaymentAmount(address, outputValue));
+                        }
+
+                        transaction = wallet.createTransaction(paymentAmounts, address);
+                        if (transaction == null) {
+                            Logger.warn("Unable to create transaction.");
+                        }
+
+                        transactionPrivateKey = coinbasePrivateKey;
+                    }
+
+                    try {
+                        final MutableList<Transaction> transactions = _createFanOutTransactions(transaction, transactionPrivateKey, blockHeight);
+                        transactions.add(transaction);
+                        return transactions;
+                    }
+                    catch (final Exception exception) {
+                        Logger.warn(exception);
+                        return null;
+                    }
+                }
+            });
+            blockHeaders.addAll(fanOutBlocks);
+            for (final BlockHeader blockHeader : fanOutBlocks) {
+                final Sha256Hash blockHash = blockHeader.getHash();
+                manifestJson.add(blockHash);
+            }
+
+            Logger.info("Generating fan-in blocks.");
+            final Long firstFanInBlockHeight = (long) blockHeaders.getCount();
+            final List<BlockHeader> fanInBlocks = _generateBlocks(privateKeyGenerator, 2, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+                @Override
+                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
+                    final MutableList<TransactionWithBlockHeight> transactionsToSpend;
+                    {
+                        final long blockHeightToSpend = (firstFanOutBlockHeight + (blockHeight - firstFanInBlockHeight)); // spend the fan-out blocks txns in-order... (NOTE: not all of them are spent due to max block size)
+                        final Sha256Hash blockHash = blockHeaders.get((int) blockHeightToSpend).getHash();
+                        final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
+                        final int transactionCount = blockToSpend.getTransactionCount();
+                        transactionsToSpend = new MutableList<>(transactionCount - 1);
+
+                        final List<Transaction> transactions = blockToSpend.getTransactions();
+                        for (int i = 1; i < transactionCount; ++i) {
+                            final Transaction transaction = transactions.get(i);
+                            transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
+                        }
+                    }
+
+                    try {
+                        return _createFanInTransactions(transactionsToSpend, blockHeight);
+                    }
+                    catch (final Exception exception) {
+                        Logger.warn(exception);
+                        return null;
+                    }
+                }
+            });
+            blockHeaders.addAll(fanInBlocks);
+            for (final BlockHeader blockHeader : fanInBlocks) {
+                final Sha256Hash blockHash = blockHeader.getHash();
+                manifestJson.add(blockHash);
+            }
+
+            Logger.info("Generating steady-state blocks.");
+            final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
+            final List<BlockHeader> steadyStateBlocks = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+                @Override
+                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
+                    final MutableList<TransactionWithBlockHeight> transactionsToSpend;
+                    {
+                        final long blockHeightToSpend = (firstFanInBlockHeight + (blockHeight - firstSteadyStateBlockHeight)); // spend the fan-in blocks txns in-order...
+                        Logger.info("Spending " + blockHeightToSpend + " for block#" + blockHeight);
+                        final Sha256Hash blockHash;
+                        {
+                            if (blockHeightToSpend < blockHeaders.getCount()) {
+                                blockHash = blockHeaders.get((int) blockHeightToSpend).getHash();
+                            }
+                            else {
+                                final int index = (int) (blockHeightToSpend - blockHeaders.getCount());
+                                blockHash = createdBlocks.get(index).getHash();
+                            }
+                        }
+
+                        Logger.info("Spending " + blockHash);
+                        final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
+                        final int transactionCount = blockToSpend.getTransactionCount();
+                        Logger.info("transactionCount=" + transactionCount);
+                        transactionsToSpend = new MutableList<>(transactionCount - 1);
+
+                        final List<Transaction> transactions = blockToSpend.getTransactions();
+                        for (int i = 1; i < transactionCount; ++i) {
+                            final Transaction transaction = transactions.get(i);
+                            transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
+                        }
+                    }
+
+                    try {
+                        return _createSteadyStateTransactions(transactionsToSpend, blockHeight);
+                    }
+                    catch (final Exception exception) {
+                        Logger.warn(exception);
+                        return null;
+                    }
+                }
+            });
+            blockHeaders.addAll(steadyStateBlocks);
+            for (final BlockHeader blockHeader : steadyStateBlocks) {
+                final Sha256Hash blockHash = blockHeader.getHash();
+                manifestJson.add(blockHash);
+            }
+
+            IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(manifestJson.toString()));
+        }
     }
 }

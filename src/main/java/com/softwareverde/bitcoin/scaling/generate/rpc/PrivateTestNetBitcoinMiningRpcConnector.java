@@ -1,7 +1,6 @@
 package com.softwareverde.bitcoin.scaling.generate.rpc;
 
 import com.softwareverde.bitcoin.block.Block;
-import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnector;
 import com.softwareverde.bitcoin.rpc.BlockTemplate;
 import com.softwareverde.bitcoin.rpc.RpcNotificationCallback;
@@ -9,6 +8,7 @@ import com.softwareverde.bitcoin.rpc.RpcNotificationType;
 import com.softwareverde.bitcoin.rpc.monitor.Monitor;
 import com.softwareverde.http.server.servlet.request.Request;
 import com.softwareverde.http.server.servlet.response.Response;
+import com.softwareverde.util.Container;
 
 public class PrivateTestNetBitcoinMiningRpcConnector implements BitcoinMiningRpcConnector {
     protected static class FakeMonitor implements Monitor {
@@ -25,15 +25,15 @@ public class PrivateTestNetBitcoinMiningRpcConnector implements BitcoinMiningRpc
         public void cancel() { }
     }
 
-    protected final BlockTemplate _blockTemplate;
+    protected final Container<BlockTemplate> _blockTemplate;
 
-    public PrivateTestNetBitcoinMiningRpcConnector(final BlockTemplate blockTemplate) {
-        _blockTemplate = blockTemplate;
+    public PrivateTestNetBitcoinMiningRpcConnector(final Container<BlockTemplate> blockTemplateContainer) {
+        _blockTemplate = blockTemplateContainer;
     }
 
     @Override
     public BlockTemplate getBlockTemplate(final Monitor monitor) {
-        return _blockTemplate;
+        return _blockTemplate.value;
     }
 
     @Override
