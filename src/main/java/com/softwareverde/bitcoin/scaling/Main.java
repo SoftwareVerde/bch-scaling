@@ -65,7 +65,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class Main {
-    protected static final Boolean SKIP_MINING = true;
+    protected static final Boolean SKIP_MINING = false;
 
     protected interface TransactionGenerator {
         List<Transaction> getTransactions(Long blockHeight, List<BlockHeader> newBlockHeaders);
@@ -541,7 +541,7 @@ public class Main {
         final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
 
         final TransactionDeflater transactionDeflater = new TransactionDeflater();
-        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT);
+        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT + 8);
 
         final int batchSize = 32;
         final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
@@ -608,7 +608,7 @@ public class Main {
         final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
 
         final TransactionDeflater transactionDeflater = new TransactionDeflater();
-        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT);
+        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT + 8L);
 
         final int batchSize = 128;
         final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
@@ -619,6 +619,9 @@ public class Main {
 
                 final NanoTimer nanoTimer = new NanoTimer();
                 nanoTimer.start();
+
+                long fee = 500;
+                final long maxFee = 100000L;
 
                 int outputsToSpendCount = 0;
                 for (final TransactionWithBlockHeight transactionWithBlockHeight : batchItems) {
@@ -633,36 +636,52 @@ public class Main {
                     }
                     wallet.addTransaction(transactionWithBlockHeight.transaction);
 
-                    final Long fee = 500L;
+                    // long fee = wallet.calculateFees(2, outputsToSpendCount);
 
-                    final Long amount = wallet.getBalance();
-                    final Long amount0 = (amount / 2L);
-                    final Long amount1 = (amount - amount0 - fee);
+                    Transaction transaction = null;
+                    while (transaction == null && fee <= maxFee) {
+                        final Long amount = wallet.getBalance();
+                        if (amount < 1L) {
+                            Logger.debug("Zero wallet balance; invalid private key?");
+                        }
+                        final Long amount0 = (amount / 2L);
+                        final Long amount1 = (amount - amount0 - fee);
 
-                    if (amount1 < 1L) { continue; }
+                        if (amount1 < 1L) { break; }
 
-                    final Address changeAddress;
-                    final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
-                    {
-                        final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount0);
-                        final Address address = addressInflater.fromPrivateKey(privateKey, true);
+                        final Address changeAddress;
+                        final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
+                        {
+                            final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount0);
+                            final Address address = addressInflater.fromPrivateKey(privateKey, true);
 
-                        paymentAmounts.add(new PaymentAmount(address, amount0));
+                            paymentAmounts.add(new PaymentAmount(address, amount0));
+                        }
+                        {
+                            final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount1);
+                            final Address address = addressInflater.fromPrivateKey(privateKey, true);
+
+                            paymentAmounts.add(new PaymentAmount(address, amount1));
+                            changeAddress = address;
+                        }
+
+                        transaction = wallet.createTransaction(paymentAmounts, changeAddress);
+                        if (transaction == null) {
+                            fee += 500L;
+                            // Logger.debug("Setting Fee: " + fee + "; amount=" + amount + " amount0=" + amount0 + " amount1=" + amount1);
+                        }
                     }
-                    {
-                        final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount1);
-                        final Address address = addressInflater.fromPrivateKey(privateKey, true);
-
-                        paymentAmounts.add(new PaymentAmount(address, amount1));
-                        changeAddress = address;
+                    if (transaction == null) {
+                        Logger.debug("Unable to create transaction.");
+                        break;
                     }
-
-                    final Transaction transaction = wallet.createTransaction(paymentAmounts, changeAddress);
-                    if (transaction == null) { break; }
 
                     final Integer byteCount = transactionDeflater.getByteCount(transaction);
                     final long newBlockSize = blockSize.addAndGet(byteCount);
-                    if (newBlockSize >= maxBlockSize) { return; }
+                    if (newBlockSize >= maxBlockSize) {
+                        Logger.debug("Max block size reached: " + newBlockSize + " of " + maxBlockSize);
+                        return;
+                    }
 
                     transactions.add(transaction);
 
@@ -671,7 +690,21 @@ public class Main {
             }
         });
 
-        return new MutableList<>(transactions);
+        final MutableList<Transaction> createdTransactions = new MutableList<>(transactions);
+        Logger.debug("Created " + createdTransactions.getCount() + " transactions.");
+        return createdTransactions;
+    }
+
+    protected static Sha256Hash getBlockHash(final Long blockHeight, final List<BlockHeader> blockHeaders, final List<BlockHeader> newBlockHeaders) {
+        if (blockHeight < blockHeaders.getCount()) {
+            final int blockHeightInt = blockHeight.intValue();
+            final BlockHeader blockHeader = blockHeaders.get(blockHeightInt);
+            return blockHeader.getHash();
+        }
+
+        final int index = (int) (blockHeight - blockHeaders.getCount());
+        final BlockHeader blockHeader = newBlockHeaders.get(index);
+        return blockHeader.getHash();
     }
 
     public void run() {
@@ -773,6 +806,60 @@ public class Main {
                 manifestJson.add(blockHash);
             }
 
+            Logger.info("Generating steady-state blocks.");
+            final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
+            final List<BlockHeader> steadyStateBlocks = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+                @Override
+                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
+                    final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
+                    {
+                        final StringBuilder stringBuilder = new StringBuilder("blockHeight=" + blockHeight);
+                        // Spending only first half of each 10 fan-out blocks, over 5 steady-state blocks, means each steady state block spends 1/5 of 1/2 of each fan-out block.
+                        final int steadyStateBlockIndex = (int) (blockHeight - firstSteadyStateBlockHeight);
+                        stringBuilder.append(" steadyStateBlockIndex=" + steadyStateBlockIndex);
+                        for (int i = 0; i < 10; ++i) {
+                            stringBuilder.append(" (");
+                            final long blockHeightToSpend = (firstFanOutBlockHeight + i); // (firstFanOutBlockHeight + steadyStateBlockIndex + i)
+                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
+                            final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
+                            stringBuilder.append("blockHeightToSpend=" + blockHeightToSpend + " blockHash=" + blockHash);
+
+                            final int transactionCount = blockToSpend.getTransactionCount();
+                            stringBuilder.append(" transactionCount=" + transactionCount);
+                            final int transactionCountToSpend = ((transactionCount / 2) / 5); // (transactionCount / 5)
+                            stringBuilder.append(" transactionCountToSpend=" + transactionCountToSpend);
+                            final List<Transaction> transactions = blockToSpend.getTransactions();
+                            stringBuilder.append(" transactions.count=" + transactions.getCount());
+                            final int startIndex = (1 + (transactionCountToSpend * steadyStateBlockIndex));
+                            stringBuilder.append(" startIndex=" + startIndex);
+                            final int endIndex = (transactionCountToSpend + startIndex);
+                            for (int j = startIndex; j < endIndex; ++j) {
+                                if (j >= transactionCount) { break; }
+
+                                final Transaction transaction = transactions.get(j);
+                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
+                            }
+                            stringBuilder.append(")");
+                        }
+                        // Logger.debug(stringBuilder);
+                    }
+                    // Logger.debug("transactionsToSpend.count=" + transactionsToSpend.getCount());
+
+                    try {
+                        return _createSteadyStateTransactions(transactionsToSpend, blockHeight);
+                    }
+                    catch (final Exception exception) {
+                        Logger.warn(exception);
+                        return null;
+                    }
+                }
+            });
+            blockHeaders.addAll(steadyStateBlocks);
+            for (final BlockHeader blockHeader : steadyStateBlocks) {
+                final Sha256Hash blockHash = blockHeader.getHash();
+                manifestJson.add(blockHash);
+            }
+
             Logger.info("Generating fan-in blocks.");
             final Long firstFanInBlockHeight = (long) blockHeaders.getCount();
             final List<BlockHeader> fanInBlocks = _generateBlocks(privateKeyGenerator, 2, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
@@ -780,7 +867,7 @@ public class Main {
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend;
                     {
-                        final long blockHeightToSpend = (firstFanOutBlockHeight + (blockHeight - firstFanInBlockHeight)); // spend the fan-out blocks txns in-order... (NOTE: not all of them are spent due to max block size)
+                        final long blockHeightToSpend = (firstSteadyStateBlockHeight + (blockHeight - firstFanInBlockHeight)); // spend the steady-state blocks txns in-order...
                         final Sha256Hash blockHash = blockHeaders.get((int) blockHeightToSpend).getHash();
                         final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
                         final int transactionCount = blockToSpend.getTransactionCount();
@@ -808,36 +895,43 @@ public class Main {
                 manifestJson.add(blockHash);
             }
 
-            Logger.info("Generating steady-state blocks.");
-            final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> steadyStateBlocks = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            Logger.info("Generating 2nd steady-state blocks.");
+            final Long firstSteadyStateBlockHeightRoundTwo = (long) blockHeaders.getCount();
+            final List<BlockHeader> steadyStateBlocksRoundTwo = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final MutableList<TransactionWithBlockHeight> transactionsToSpend;
+                    final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
                     {
-                        final long blockHeightToSpend = (firstFanInBlockHeight + (blockHeight - firstSteadyStateBlockHeight)); // spend the fan-in blocks txns in-order...
-                        Logger.info("Spending " + blockHeightToSpend + " for block#" + blockHeight);
-                        final Sha256Hash blockHash;
+                        final int steadyStateBlockIndex = (int) (blockHeight - firstSteadyStateBlockHeightRoundTwo); // the Nth of 5 steady state blocks...
+
+                        // Spend the respective fan-in block...
                         {
-                            if (blockHeightToSpend < blockHeaders.getCount()) {
-                                blockHash = blockHeaders.get((int) blockHeightToSpend).getHash();
-                            }
-                            else {
-                                final int index = (int) (blockHeightToSpend - blockHeaders.getCount());
-                                blockHash = createdBlocks.get(index).getHash();
+                            final long blockHeightToSpend = (firstFanInBlockHeight + steadyStateBlockIndex);
+                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
+                            final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
+                            final List<Transaction> transactions = blockToSpend.getTransactions();
+                            for (int i = 1; i < transactions.getCount(); ++i) {
+                                final Transaction transaction = transactions.get(i);
+                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
                             }
                         }
 
-                        Logger.info("Spending " + blockHash);
-                        final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
-                        final int transactionCount = blockToSpend.getTransactionCount();
-                        Logger.info("transactionCount=" + transactionCount);
-                        transactionsToSpend = new MutableList<>(transactionCount - 1);
+                        // And spend only second half of each 10 fan-out blocks, over 5 steady-state blocks, means each steady state block spends 1/5 of 1/2 of each fan-out block.
+                        for (int i = 0; i < 10; ++i) {
+                            final long blockHeightToSpend = (firstFanOutBlockHeight + steadyStateBlockIndex + i);
+                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
+                            final Block blockToSpend = _loadBlock(blockHash, defaultScenarioDirectory);
 
-                        final List<Transaction> transactions = blockToSpend.getTransactions();
-                        for (int i = 1; i < transactionCount; ++i) {
-                            final Transaction transaction = transactions.get(i);
-                            transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
+                            final int transactionCount = blockToSpend.getTransactionCount();
+                            final int transactionCountToSpend = (transactionCount / 5);
+                            final List<Transaction> transactions = blockToSpend.getTransactions();
+                            final int startIndex = (1 + (transactionCountToSpend * steadyStateBlockIndex)) + (transactionCount / 2);
+                            for (int j = startIndex; j < transactionCountToSpend; ++j) {
+                                if (j >= transactionCount) { break; }
+
+                                final Transaction transaction = transactions.get(j);
+                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
+                            }
                         }
                     }
 
@@ -850,8 +944,8 @@ public class Main {
                     }
                 }
             });
-            blockHeaders.addAll(steadyStateBlocks);
-            for (final BlockHeader blockHeader : steadyStateBlocks) {
+            blockHeaders.addAll(steadyStateBlocksRoundTwo);
+            for (final BlockHeader blockHeader : steadyStateBlocksRoundTwo) {
                 final Sha256Hash blockHash = blockHeader.getHash();
                 manifestJson.add(blockHash);
             }
