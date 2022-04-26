@@ -22,6 +22,7 @@ import com.softwareverde.bitcoin.rpc.BlockTemplate;
 import com.softwareverde.bitcoin.rpc.MutableBlockTemplate;
 import com.softwareverde.bitcoin.rpc.RpcCredentials;
 import com.softwareverde.bitcoin.rpc.core.BitcoinCoreRpcConnector;
+import com.softwareverde.bitcoin.rpc.monitor.Monitor;
 import com.softwareverde.bitcoin.scaling.generate.rpc.PrivateTestNetBitcoinMiningRpcConnector;
 import com.softwareverde.bitcoin.server.database.BatchRunner;
 import com.softwareverde.bitcoin.server.main.BitcoinConstants;
@@ -36,6 +37,7 @@ import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.Wallet;
 import com.softwareverde.concurrent.threadpool.CachedThreadPool;
+import com.softwareverde.concurrent.threadpool.ThreadPool;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.bytearray.MutableByteArray;
 import com.softwareverde.constable.list.List;
@@ -192,28 +194,90 @@ public class Main {
         return blockTemplate;
     }
 
+    protected static class StratumServer extends BitcoinCoreStratumServer {
+        public StratumServer(final BitcoinMiningRpcConnectorFactory rpcConnectionFactory, final Integer stratumPort, final ThreadPool threadPool, final MasterInflater masterInflater) {
+            super(rpcConnectionFactory, stratumPort, threadPool, masterInflater);
+        }
+
+        @Override
+        public void setCoinbaseAddress(final Address address) {
+            super.setCoinbaseAddress(address);
+        }
+
+        public void rebuildBlockTemplate() {
+            _rebuildBlockTemplate();
+        }
+
+        public void abandonMiningTasks() {
+            _blockTemplate = null;
+            _abandonMiningTasks();
+        }
+    }
+
     protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
-        final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext = new PrivateTestNetDifficultyCalculatorContext();
-        difficultyCalculatorContext.addBlocks(initBlocks);
-
-        final Container<BlockTemplate> blockTemplateContainer = new Container<>(null);
-        final BitcoinMiningRpcConnectorFactory rpcConnectorFactory = new BitcoinMiningRpcConnectorFactory() {
-            @Override
-            public BitcoinMiningRpcConnector newBitcoinMiningRpcConnector() {
-                return new PrivateTestNetBitcoinMiningRpcConnector(blockTemplateContainer);
-            }
-        };
-
         final AddressInflater addressInflater = new AddressInflater();
         final BlockDeflater blockDeflater = new BlockDeflater();
         final MasterInflater masterInflater = new CoreInflater();
         final CachedThreadPool threadPool = new CachedThreadPool(32, 10000L);
-        final StratumServer stratumServer = new BitcoinCoreStratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater);
-
 
         final int initBlockCount = initBlocks.getCount();
         final BlockHeader lastInitBlock = initBlocks.get(initBlockCount - 1);
         final MutableList<BlockHeader> createdBlocks = new MutableList<>(blockCount);
+
+        final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext = new PrivateTestNetDifficultyCalculatorContext();
+        difficultyCalculatorContext.addBlocks(initBlocks);
+
+        final Container<BlockTemplate> blockTemplateContainer = new Container<>(null);
+
+        final Container<StratumServer> stratumServerContainer = new Container<>();
+        final Container<BlockFoundCallback> blockFoundCallbackContainer = new Container<>();
+        final BitcoinMiningRpcConnectorFactory rpcConnectorFactory = new BitcoinMiningRpcConnectorFactory() {
+            @Override
+            public BitcoinMiningRpcConnector newBitcoinMiningRpcConnector() {
+                return new PrivateTestNetBitcoinMiningRpcConnector(blockTemplateContainer) {
+                    @Override
+                    public Boolean submitBlock(final Block block, final Monitor monitor) {
+                        final BlockHeader lastCreatedBlock;
+                        synchronized (createdBlocks) {
+                            final int createdBlockCount = createdBlocks.getCount();
+                            lastCreatedBlock = ((createdBlockCount < 1) ? lastInitBlock : createdBlocks.get(createdBlockCount - 1));
+                        }
+
+                        final Sha256Hash blockHash = block.getHash();
+                        final Sha256Hash expectedPreviousBlockHash = lastCreatedBlock.getHash();
+                        final Sha256Hash previousBlockHash = block.getPreviousBlockHash();
+
+                        if (! Util.areEqual(expectedPreviousBlockHash, previousBlockHash)) {
+                            // Logger.debug("Rejected: " + blockHash + " " + expectedPreviousBlockHash + " != " + previousBlockHash);
+                            return false;
+                        }
+
+                        final StratumServer stratumServer = stratumServerContainer.value;
+                        if (stratumServer != null) {
+                            stratumServer.abandonMiningTasks();
+                        }
+
+                        synchronized (blockTemplateContainer) {
+                            if (blockTemplateContainer.value != null) {
+                                blockTemplateContainer.value = null;
+
+                                (new Thread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        blockFoundCallbackContainer.value.run(block, "");
+                                    }
+                                })).start();
+                            }
+                        }
+
+                        return super.submitBlock(block, monitor);
+                    }
+                };
+            }
+        };
+
+        final StratumServer stratumServer = new StratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater);
+        stratumServerContainer.value = stratumServer;
 
         {
             final int blocksCount = initBlocks.getCount();
@@ -227,46 +291,34 @@ public class Main {
             final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(nextBlockHeight);
             final Address address = addressInflater.fromPrivateKey(privateKey, true);
             stratumServer.setCoinbaseAddress(address);
+            stratumServer.rebuildBlockTemplate();
         }
 
         if (! blocksDirectory.exists()) { blocksDirectory.mkdirs(); }
 
         final BlockFoundCallback blockFoundCallback = new BlockFoundCallback() {
             @Override
-            public synchronized void run(final Block block, final String workerName) {
-                blockTemplateContainer.value = null;
-
+            public void run(final Block block, final String workerName) {
                 final int createdBlockCount;
-                final BlockHeader lastCreatedBlock;
                 synchronized (createdBlocks) {
                     createdBlockCount = createdBlocks.getCount();
                     if (createdBlockCount >= blockCount) {
                         createdBlocks.notifyAll();
                         return;
                     }
-
-                    lastCreatedBlock = ((createdBlockCount < 1) ? lastInitBlock : createdBlocks.get(createdBlockCount - 1));
                 }
 
                 final Sha256Hash blockHash = block.getHash();
-                {
-                    final Sha256Hash expectedPreviousBlockHash = lastCreatedBlock.getHash();
-                    final Sha256Hash previousBlockHash = block.getPreviousBlockHash();
-
-                    if (! Util.areEqual(expectedPreviousBlockHash, previousBlockHash)) {
-                        Logger.debug("Rejected: " + blockHash + " " + expectedPreviousBlockHash + " != " + previousBlockHash);
-                        return;
-                    }
-                }
-
                 final ByteArray blockBytes = blockDeflater.toBytes(block);
 
                 final File file = new File(blocksDirectory, blockHash.toString());
                 IoUtil.putFileContents(file, blockBytes);
 
                 final BlockHeader blockHeader = new ImmutableBlockHeader(block);
+                final int newCreatedBlockCount;
                 synchronized (createdBlocks) {
                     createdBlocks.add(blockHeader);
+                    newCreatedBlockCount = createdBlocks.getCount();
                 }
                 difficultyCalculatorContext.addBlock(blockHeader);
 
@@ -275,7 +327,7 @@ public class Main {
 
                 _sendBlock(block);
 
-                if (createdBlocks.getCount() >= blockCount) {
+                if (newCreatedBlockCount >= blockCount) {
                     synchronized (createdBlocks) {
                         createdBlocks.notifyAll();
                         return;
@@ -292,8 +344,10 @@ public class Main {
                 final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(nextBlockHeight);
                 final Address address = addressInflater.fromPrivateKey(privateKey, true);
                 stratumServer.setCoinbaseAddress(address);
+                stratumServer.rebuildBlockTemplate();
             }
         };
+        blockFoundCallbackContainer.value = blockFoundCallback;
 
         if (SKIP_MINING) {
             while (true) {
@@ -320,8 +374,6 @@ public class Main {
             }
             return createdBlocks;
         }
-
-        stratumServer.setBlockFoundCallback(blockFoundCallback);
 
         threadPool.start();
         stratumServer.start();
@@ -441,7 +493,7 @@ public class Main {
         Logger.debug("Sent: " + block.getHash());
     }
 
-    protected MutableList<Transaction> _createFanOutTransactions(final Transaction rootTransactionToSpend, final PrivateKey privateKey, final Long blockHeight) throws Exception {
+    protected static MutableList<Transaction> createFanOutTransactions(final Transaction rootTransactionToSpend, final PrivateKey privateKey, final Long blockHeight) throws Exception {
         final int transactionCount = 256000;
         final int outputsPerTransactionCount = 25; // TxSize = 158 + (34 * OutputCount) ~= 1024
 
@@ -765,7 +817,6 @@ public class Main {
                     final Transaction transaction;
                     final PrivateKey transactionPrivateKey;
                     {
-
                         final Wallet wallet = new Wallet();
                         wallet.addPrivateKey(coinbasePrivateKey);
                         wallet.addTransaction(transactionToSplit);
@@ -790,7 +841,7 @@ public class Main {
                     }
 
                     try {
-                        final MutableList<Transaction> transactions = _createFanOutTransactions(transaction, transactionPrivateKey, blockHeight);
+                        final MutableList<Transaction> transactions = Main.createFanOutTransactions(transaction, transactionPrivateKey, blockHeight);
                         transactions.add(transaction);
                         return transactions;
                     }
