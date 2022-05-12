@@ -59,6 +59,7 @@ import com.softwareverde.util.ByteUtil;
 import com.softwareverde.util.Container;
 import com.softwareverde.util.IoUtil;
 import com.softwareverde.util.StringUtil;
+import com.softwareverde.util.Tuple;
 import com.softwareverde.util.Util;
 import com.softwareverde.util.timer.NanoTimer;
 
@@ -435,7 +436,7 @@ public class Main {
 
             if (shouldWait) {
                 synchronized (_servedBlocks) {
-                    while (!_servedBlocks.contains(blockHash)) {
+                    while (! _servedBlocks.contains(blockHash)) {
                         try {
                             _servedBlocks.wait(); // Wait for the block to be downloaded...
                         }
@@ -462,12 +463,14 @@ public class Main {
     protected final Sha256Hash _genesisBlockHash = Sha256Hash.fromHexString(BitcoinConstants.getGenesisBlockHash());
     protected CachedThreadPool _threadPool;
     protected BitcoinNode _bitcoinNode;
+    protected final ConcurrentHashMap<Sha256Hash, Block> _initBlocks = new ConcurrentHashMap<>();
     protected final ConcurrentHashSet<Sha256Hash> _servedBlocks = new ConcurrentHashSet<>();
     protected Sha256Hash _currentBlockHash;
     protected ConcurrentHashMap<Sha256Hash, Transaction> _transactionsBeingServed = new ConcurrentHashMap<>();
 
-    protected MutableList<BlockHeader> _loadInitBlocks(final File blocksBaseDirectory) {
-        final MutableList<BlockHeader> initBlocks = new MutableList<>();
+    protected Tuple<MutableList<BlockHeader>, MutableList<Block>> _loadInitBlocks(final File blocksBaseDirectory) {
+        final MutableList<BlockHeader> initBlockHeaders = new MutableList<>();
+        final MutableList<Block> initBlocks = new MutableList<>();
 
         final BlockInflater blockInflater = new BlockInflater();
         final Json mainNetBlocks = Json.parse(IoUtil.getResource("/manifest.json")); // Genesis through Block #144 (inclusive)
@@ -497,15 +500,18 @@ public class Main {
             }
 
             final BlockHeader blockHeader = new ImmutableBlockHeader(block);
-            initBlocks.add(blockHeader);
+            initBlockHeaders.add(blockHeader);
+            initBlocks.add(block);
 
-            _sendBlock(block, null, null, false);
+            if (! USE_P2P_BROADCAST) {
+                _sendBlock(block, null, null, false);
+            }
         }
 
-        Logger.debug(initBlocks.getCount() + " blocks loaded.");
-        Logger.debug("HeadBlock=" + initBlocks.get(initBlocks.getCount() - 1).getHash());
+        Logger.debug(initBlockHeaders.getCount() + " blocks loaded.");
+        Logger.debug("HeadBlock=" + initBlockHeaders.get(initBlockHeaders.getCount() - 1).getHash());
 
-        return initBlocks;
+        return new Tuple<>(initBlockHeaders, initBlocks);
     }
 
     protected void _writeTransactionGenerationOrder(final Transaction transaction, final List<Transaction> transactions, final File defaultScenarioDirectory, final Long blockHeight) {
@@ -577,13 +583,16 @@ public class Main {
                 @Override
                 public void run(final BitcoinNode bitcoinNode, final List<InventoryItem> dataHashes) {
                     for (final InventoryItem inventoryItem : dataHashes) {
+                        Logger.debug("Node Requested: " + inventoryItem);
+
                         final InventoryItemType itemType = inventoryItem.getItemType();
                         if (itemType == InventoryItemType.BLOCK) {
                             final Sha256Hash blockHash = inventoryItem.getItemHash();
-                            final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                            final Block block = Util.coalesce(_initBlocks.get(blockHash), DiskUtil.loadBlock(blockHash, defaultScenarioDirectory));
                             if (block == null) { continue; }
 
                             bitcoinNode.transmitBlock(block);
+                            Logger.debug("Served: " + blockHash);
 
                             synchronized (_servedBlocks) {
                                 _servedBlocks.add(blockHash);
@@ -595,6 +604,7 @@ public class Main {
                             final Transaction transaction = _transactionsBeingServed.get(transactionHash);
                             if (transaction != null) {
                                 bitcoinNode.transmitTransaction(transaction);
+                                Logger.debug("Served: " + transactionHash);
                             }
                         }
                     }
@@ -645,22 +655,29 @@ public class Main {
             pin.waitForRelease();
         }
 
-        final List<BlockHeader> initBlocks = _loadInitBlocks(blocksBaseDirectory);
-        blockHeaders.addAll(initBlocks);
+        final Tuple<MutableList<BlockHeader>, MutableList<Block>> tuple = _loadInitBlocks(blocksBaseDirectory);
+        final List<BlockHeader> initBlockHeaders = tuple.first;
+        for (final Block block : tuple.second) {
+            final Sha256Hash blockHash = block.getHash();
+            _initBlocks.put(blockHash, block);
+        }
+        blockHeaders.addAll(initBlockHeaders);
 
         final File manifestFile = new File(defaultScenarioDirectory, "manifest.json");
-        final int initBlockCount = initBlocks.getCount();
+        final int initBlockCount = initBlockHeaders.getCount();
         if (manifestFile.exists()) {
             if (USE_P2P_BROADCAST) {
+
+                _bitcoinNode.transmitBlockHeaders(blockHeaders);
+
                 final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
                 for (int i = 0; i < blocksManifestJson.length(); ++i) {
                     final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
-                    final BlockHeaderWithTransactionCount block = DiskUtil.loadBlockHeader(blockHash, defaultScenarioDirectory);
-                    final Integer transactionCount = block.getTransactionCount();
-                    _sendBlockHeader(block, transactionCount);
 
-                    final long blockHeight = (initBlockCount + i);
-                    Logger.debug("headerHeight=" + blockHeight);
+                    final Long blockHeight = (long) (initBlockCount + i);
+                    final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                    final Boolean shouldWait = (i > 2);
+                    _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
                 }
 
                 while (true) {
