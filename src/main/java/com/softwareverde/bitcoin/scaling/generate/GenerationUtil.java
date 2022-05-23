@@ -346,6 +346,7 @@ public class GenerationUtil {
         }
         Logger.debug(availableUtxos.getCount() + " UTXOs available, with " + availableBalance + " satoshis total available.");
 
+        int unspendableCount = 0;
         while (blockSize < maxBlockSize) {
             if (availableUtxos.isEmpty()) { break; }
 
@@ -375,7 +376,10 @@ public class GenerationUtil {
                     isSpendableWallet.addTransaction(transaction, new ImmutableList<>(outputIndex));
                     isSpendable = (isSpendableWallet.getBalance() > 0L);
                 }
-                if (! isSpendable) { continue; }
+                if (! isSpendable) {
+                    unspendableCount += 1;
+                    continue;
+                }
 
                 wallet.addPrivateKey(privateKey);
                 spendableWalletBalance += testUtxo.getAmount();
@@ -476,19 +480,12 @@ public class GenerationUtil {
 
                 break;
             }
-            // else {
-                // minBalance = defaultMinBalance;
 
             final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
             for (int i = 0; i < transactionOutputs.getCount(); ++i) {
                 final TestUtxo utxo = new TestUtxo(transaction, i, blockHeight);
                 availableUtxos.add(utxo);
             }
-
-//            if ((int) (Math.random() * 1000) == 0) {
-//                Logger.debug("Created tx spending " + transaction.getTransactionInputs().getCount() + " creating " + transaction.getTransactionOutputs().getCount() + " outputs.");
-//            }
-            // }
 
             final Integer byteCount = transactionDeflater.getByteCount(transaction);
             blockSize += byteCount;
@@ -499,6 +496,10 @@ public class GenerationUtil {
             else {
                 transactions.add(transaction);
             }
+        }
+
+        if (unspendableCount > 0) {
+            Logger.debug("Unspendable output count: " + unspendableCount);
         }
 
         final MutableList<Transaction> createdTransactions = new MutableList<>(transactions);

@@ -71,7 +71,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class Main {
+public class Main implements AutoCloseable {
     public static final Boolean SKIP_SEND = true;
     public static final Boolean SKIP_MINING = true;
     public static final Float PRE_RELAY_PERCENT = 0F;
@@ -89,8 +89,9 @@ public class Main {
         Logger.setLogLevel("com.softwareverde.bitcoin.stratum.BitcoinCoreStratumServer", LogLevel.WARN);
         Logger.setLogLevel("com.softwareverde.bitcoin.wallet.Wallet", LogLevel.WARN);
 
-        final Main main = new Main();
-        main.run();
+        try (final Main main = new Main()) {
+            main.run();
+        }
     }
 
     public static Sha256Hash getBlockHash(final Long blockHeight, final List<BlockHeader> blockHeaders, final List<BlockHeader> newBlockHeaders) {
@@ -122,6 +123,9 @@ public class Main {
     }
 
     protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
+        if (blockCount > 0) {
+            Logger.debug("Generating " + blockCount + " blocks.");
+        }
         final AddressInflater addressInflater = new AddressInflater();
         final BlockDeflater blockDeflater = new BlockDeflater();
         final MasterInflater masterInflater = new CoreInflater();
@@ -130,6 +134,7 @@ public class Main {
         final int initBlockCount = initBlocks.getCount();
         final BlockHeader lastInitBlock = initBlocks.get(initBlockCount - 1);
         final MutableList<BlockHeader> createdBlocks = new MutableList<>(blockCount);
+        if (blockCount < 1) { return createdBlocks; }
 
         final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext = new PrivateTestNetDifficultyCalculatorContext();
         difficultyCalculatorContext.addBlocks(initBlocks);
@@ -325,7 +330,7 @@ public class Main {
         // _currentBlockHash = blockHash;
 
         if (SKIP_SEND) {
-            Logger.debug("Skipped: " + blockHash);
+            Logger.debug("Skipped Sending Of: " + blockHash);
             return;
         }
 
@@ -540,6 +545,7 @@ public class Main {
 
     protected Transaction _splitCoinbaseTransaction(final Long blockHeight, final Long coinbaseToSpendBlockHeight, final List<BlockHeader> blockHeaders, final File defaultScenarioDirectory, final PrivateKeyGenerator privateKeyGenerator) {
         final BlockHeader blockHeader = blockHeaders.get(coinbaseToSpendBlockHeight.intValue());
+        Logger.debug("Splitting Coinbase: " + blockHeader.getHash());
         final Block block = DiskUtil.loadBlock(blockHeader.getHash(), defaultScenarioDirectory);
 
         final Transaction transactionToSplit = block.getCoinbaseTransaction();
@@ -570,9 +576,53 @@ public class Main {
         final Transaction transaction = wallet.createTransaction(paymentAmounts, changeAddress);
         if (transaction == null) {
             Logger.warn("Unable to create transaction.");
+
+            { // Debug.
+                Logger.setLogLevel("com.softwareverde.bitcoin.wallet.Wallet", LogLevel.ON);
+                wallet.createTransaction(paymentAmounts, changeAddress);
+            }
         }
 
         return transaction;
+    }
+
+    protected MutableList<BlockHeader> _loadBlocksFromManifest(final Json blocksManifestJson, final Long runningBlockHeight, final Integer targetNewBlockCount, final File blocksDirectory) {
+        final MutableList<BlockHeader> blockHeaders = new MutableList<>(targetNewBlockCount);
+        if (blocksManifestJson == null) { return blockHeaders; }
+
+        final int mainNetBlockCount = (144 + 1); // Main Blocks + Genesis
+        final long mainNetBlockHeight = (mainNetBlockCount - 1L);
+        final int manifestBlockCount = blocksManifestJson.length();
+        final long lastManifestBlockHeight = (manifestBlockCount + mainNetBlockHeight);
+
+        final int blockCountToLoadFromManifest = Math.min(targetNewBlockCount, (int) Math.max(0L, (lastManifestBlockHeight - runningBlockHeight)));
+        if (blockCountToLoadFromManifest == 0) { return blockHeaders; }
+
+        final int manifestStartIndex = (int) (runningBlockHeight - mainNetBlockHeight);
+        for (int i = 0; i < blockCountToLoadFromManifest; ++i) {
+            final String blockHashString = blocksManifestJson.getString(manifestStartIndex + i);
+            final Sha256Hash blockHash = Sha256Hash.fromHexString(blockHashString);
+            final BlockHeader blockHeader = DiskUtil.loadBlockHeader(blockHash, blocksDirectory);
+            if (blockHeader == null) {
+                Logger.debug("Unable to load block from manifest: " + blockHash);
+                break;
+            }
+
+            blockHeaders.add(blockHeader);
+        }
+
+        return blockHeaders;
+    }
+
+    protected void _sendBlocks(final List<BlockHeader> scenarioBlocks, final Long runningBlockHeight, final File blockDirectory, final Boolean shouldWait) {
+        int i = 1;
+        for (final BlockHeader blockHeader : scenarioBlocks) {
+            final Sha256Hash blockHash = blockHeader.getHash();
+            final Block block = DiskUtil.loadBlock(blockHash, blockDirectory);
+            final Long blockHeight = (runningBlockHeight + i);
+            _sendBlock(block, blockHeight, blockDirectory, shouldWait);
+            i += 1;
+        }
     }
 
     public Main() {
@@ -583,7 +633,8 @@ public class Main {
         else {
             // bitcoin.conf:
             //  server=1
-            //  index=1
+            //  txindex=1
+            //  zmqpubhashblock=tcp://0.0.0.0:8433
             //  rpcauth=root:b971ece882a77bff1a4803c5e7b418fc$a242915ce44f887e8c28b42cfdd87592d1abffa47084e4fb7718dc982c80636a
 
             _rpcAddress = new BitcoinNodeRpcAddress("localhost", 8332);
@@ -592,12 +643,13 @@ public class Main {
     }
 
     public void run() {
-        final Integer coinbaseMaturityBlockCount = 100;
+        final int coinbaseMaturityBlockCount = 100;
 
         final MutableList<BlockHeader> blockHeaders = new MutableList<>(0);
 
         final File blocksBaseDirectory = new File("data/blocks");
         final File defaultScenarioDirectory = new File(blocksBaseDirectory, "default");
+        final int defaultScenarioBlockCount = (1 + 144 + 100 + 10 + 5 + 2 + 5 + 10); // 277
 
         if (USE_P2P_BROADCAST) {
             _threadPool = new CachedThreadPool(12, 300000L);
@@ -702,14 +754,24 @@ public class Main {
         blockHeaders.addAll(initBlockHeaders);
 
         final File manifestFile = new File(defaultScenarioDirectory, "manifest.json");
-        final int initBlockCount = initBlockHeaders.getCount();
+        final Json blocksManifestJson;
+        final Integer manifestBlockCount;
         if (manifestFile.exists()) {
-            if (USE_P2P_BROADCAST) {
+            blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+            manifestBlockCount = blocksManifestJson.length();
+        }
+        else {
+            blocksManifestJson = null;
+            manifestBlockCount = 0;
+        }
 
+        final int initBlockCount = initBlockHeaders.getCount();
+        final boolean allBlocksAreMined = ((manifestBlockCount + initBlockCount) >= defaultScenarioBlockCount);
+        if (allBlocksAreMined) {
+            if (USE_P2P_BROADCAST) {
                 _bitcoinNode.transmitBlockHeaders(blockHeaders);
 
-                final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
-                for (int i = 0; i < blocksManifestJson.length(); ++i) {
+                for (int i = 0; i < manifestBlockCount; ++i) {
                     final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
 
                     final Long blockHeight = (long) (initBlockCount + i);
@@ -728,8 +790,7 @@ public class Main {
                 }
             }
             else {
-                final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
-                for (int i = 0; i < blocksManifestJson.length(); ++i) {
+                for (int i = 0; i < manifestBlockCount; ++i) {
                     final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
 
                     final Long blockHeight = (long) (initBlockCount + i);
@@ -740,29 +801,52 @@ public class Main {
                     blockHeaders.add(blockHeader);
                 }
             }
+            return;
         }
-        else {
-            final PrivateKeyGenerator privateKeyGenerator = new PrivateKeyGenerator() {
-                @Override
-                public PrivateKey getCoinbasePrivateKey(final Long blockHeight) {
-                    return Main.derivePrivateKey(blockHeight, 50L * Transaction.SATOSHIS_PER_BITCOIN);
-                }
-            };
 
-            final Json manifestJson = new Json(true);
+        // All blocks are not mined...
+        final PrivateKeyGenerator privateKeyGenerator = new PrivateKeyGenerator() {
+            @Override
+            public PrivateKey getCoinbasePrivateKey(final Long blockHeight) {
+                return Main.derivePrivateKey(blockHeight, 50L * Transaction.SATOSHIS_PER_BITCOIN);
+            }
+        };
 
-            Logger.info("Generating spendable coinbase blocks.");
-            final Long firstScenarioBlockHeight = (long) blockHeaders.getCount();
-            final MutableList<BlockHeader> scenarioBlocks = _generateBlocks(privateKeyGenerator, coinbaseMaturityBlockCount, defaultScenarioDirectory, blockHeaders);
+        final Json newManifestJson = new Json(true);
+
+        // Copy the existing blocks to the new manifest file...
+        if (blocksManifestJson != null) {
+            for (int i = 0; i < manifestBlockCount; ++i) {
+                final String blockHashString = blocksManifestJson.getString(i);
+                newManifestJson.add(blockHashString);
+            }
+        }
+        long runningBlockHeight = (blockHeaders.getCount() - 1L);
+
+        Logger.info("Generating spendable coinbase blocks: " + runningBlockHeight);
+        // final long firstScenarioBlockHeight = blockHeaders.getCount();
+        {
+            final int targetNewBlockCount = coinbaseMaturityBlockCount;
+            final MutableList<BlockHeader> scenarioBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            _sendBlocks(scenarioBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - scenarioBlocks.getCount());
+            scenarioBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders));
             blockHeaders.addAll(scenarioBlocks);
             for (final BlockHeader blockHeader : scenarioBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
+            runningBlockHeight += scenarioBlocks.getCount();
+        }
 
-            Logger.info("Generating fan-out blocks.");
-            final Long firstFanOutBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> fanOutBlocks = _generateBlocks(privateKeyGenerator, 10, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+        Logger.info("Generating fan-out blocks: " + runningBlockHeight);
+        final Long firstFanOutBlockHeight = (long) blockHeaders.getCount();
+        {
+            final int targetNewBlockCount = 10;
+            final MutableList<BlockHeader> fanOutBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            _sendBlocks(fanOutBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - fanOutBlocks.getCount());
+            fanOutBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final long coinbaseToSpendBlockHeight = (blockHeight - coinbaseMaturityBlockCount); // preFanOutBlock...
@@ -811,16 +895,23 @@ public class Main {
                         return null;
                     }
                 }
-            });
+            }));
             blockHeaders.addAll(fanOutBlocks);
             for (final BlockHeader blockHeader : fanOutBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
+            runningBlockHeight += fanOutBlocks.getCount();
+        }
 
-            Logger.info("Generating quasi-steady-state blocks.");
-            final Long firstQuasiSteadyStateBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> quasiSteadyStateBlocks = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+        Logger.info("Generating quasi-steady-state blocks: " + runningBlockHeight);
+        final Long firstQuasiSteadyStateBlockHeight = (long) blockHeaders.getCount();
+        {
+            final int targetNewBlockCount = 5;
+            final MutableList<BlockHeader> quasiSteadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            _sendBlocks(quasiSteadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocks.getCount());
+            quasiSteadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
@@ -867,16 +958,23 @@ public class Main {
                         return null;
                     }
                 }
-            });
+            }));
             blockHeaders.addAll(quasiSteadyStateBlocks);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
+            runningBlockHeight += quasiSteadyStateBlocks.getCount();
+        }
 
-            Logger.info("Generating fan-in blocks.");
-            final Long firstFanInBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> fanInBlocks = _generateBlocks(privateKeyGenerator, 2, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+        Logger.info("Generating fan-in blocks: " + runningBlockHeight);
+        final Long firstFanInBlockHeight = (long) blockHeaders.getCount();
+        {
+            final int targetNewBlockCount = 2;
+            final MutableList<BlockHeader> fanInBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            _sendBlocks(fanInBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - fanInBlocks.getCount());
+            fanInBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend;
@@ -904,16 +1002,25 @@ public class Main {
                         return null;
                     }
                 }
-            });
+            }));
             blockHeaders.addAll(fanInBlocks);
             for (final BlockHeader blockHeader : fanInBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
+            runningBlockHeight += fanInBlocks.getCount();
+        }
 
-            Logger.info("Generating 2nd quasi-steady-state blocks.");
-            final Long firstQuasiSteadyStateBlockHeightRoundTwo = (long) blockHeaders.getCount();
-            final List<BlockHeader> quasiSteadyStateBlocksRoundTwo = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+        Logger.info("Generating 2nd quasi-steady-state blocks: " + runningBlockHeight);
+        final long firstQuasiSteadyStateBlockHeightRoundTwo = blockHeaders.getCount();
+        final MutableList<BlockHeader> quasiSteadyStateBlocksRoundTwo;
+        {
+            final int targetNewBlockCount = 5;
+            quasiSteadyStateBlocksRoundTwo = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            Logger.debug("Loaded " + quasiSteadyStateBlocksRoundTwo.getCount() + " from manifest...");
+            _sendBlocks(quasiSteadyStateBlocksRoundTwo, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocksRoundTwo.getCount());
+            quasiSteadyStateBlocksRoundTwo.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
@@ -961,13 +1068,18 @@ public class Main {
                         return null;
                     }
                 }
-            });
+            }));
             blockHeaders.addAll(quasiSteadyStateBlocksRoundTwo);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocksRoundTwo) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
+            runningBlockHeight += quasiSteadyStateBlocksRoundTwo.getCount();
+        }
 
+        Logger.info("Generating steady-state blocks: " + runningBlockHeight);
+        final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
+        {
             final MutableList<TestUtxo> availableUtxos = new MutableList<>();
             {
                 long blockHeight = firstQuasiSteadyStateBlockHeightRoundTwo;
@@ -979,8 +1091,6 @@ public class Main {
                             isCoinbase = false;
                             continue;
                         }
-
-                        final Sha256Hash transactionHash = transaction.getHash();
 
                         int outputIndex = 0;
                         for (final TransactionOutput transactionOutput : transaction.getTransactionOutputs()) {
@@ -1014,14 +1124,16 @@ public class Main {
             };
             availableUtxos.sort(testUtxoComparator);
 
-            Logger.info("Generating steady-state blocks.");
-            final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> steadyStateBlocks = _generateBlocks(privateKeyGenerator, 10, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            final int targetNewBlockCount = 10;
+            final MutableList<BlockHeader> steadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
+            _sendBlocks(steadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            final int newBlockCount = (targetNewBlockCount - steadyStateBlocks.getCount());
+            steadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final int blockOffset = (int) (blockHeight - firstSteadyStateBlockHeight);
                     final long spendBlockHeight = (156L + blockOffset);
-                    Logger.debug("Spending " + spendBlockHeight + " coinbase.");
+                    Logger.debug("Spending Block #" + spendBlockHeight + "'s coinbase.");
                     final Transaction additionalTransactionFromPreviousCoinbase = _splitCoinbaseTransaction(blockHeight, spendBlockHeight, blockHeaders, defaultScenarioDirectory, privateKeyGenerator);
                     { // Add the coinbase UTXOs to the pool.
                         final List<TransactionOutput> transactionOutputs = additionalTransactionFromPreviousCoinbase.getTransactionOutputs();
@@ -1049,16 +1161,20 @@ public class Main {
                         return null;
                     }
                 }
-            });
+            }));
             blockHeaders.addAll(steadyStateBlocks);
             for (final BlockHeader blockHeader : steadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
-                manifestJson.add(blockHash);
+                newManifestJson.add(blockHash);
             }
-
-            IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(manifestJson.toString()));
+            runningBlockHeight += steadyStateBlocks.getCount();
         }
 
+        IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(newManifestJson.toString()));
+    }
+
+    @Override
+    public void close() {
         if (_bitcoinNode != null) {
             _bitcoinNode.disconnect();
         }
