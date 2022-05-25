@@ -35,6 +35,7 @@ import com.softwareverde.bitcoin.server.node.BitcoinNode;
 import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
 import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionInflater;
+import com.softwareverde.bitcoin.transaction.input.TransactionInput;
 import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.Wallet;
@@ -63,17 +64,19 @@ import com.softwareverde.util.StringUtil;
 import com.softwareverde.util.Tuple;
 import com.softwareverde.util.Util;
 import com.softwareverde.util.timer.NanoTimer;
+import com.softwareverde.util.type.time.SystemTime;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Main implements AutoCloseable {
-    public static final Boolean SKIP_SEND = true;
-    public static final Boolean SKIP_MINING = true;
+    public static final Boolean SKIP_SEND = false;
+    public static final Boolean SKIP_MINING = false;
     public static final Float PRE_RELAY_PERCENT = 0F;
     public static final Boolean USE_P2P_BROADCAST = false;
     public static final Boolean IS_BITCOIN_VERDE_NODE = false;
@@ -118,11 +121,11 @@ public class Main implements AutoCloseable {
         return PrivateKey.fromBytes(bytes);
     }
 
-    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks) {
-        return _generateBlocks(privateKeyGenerator, blockCount, blocksDirectory, initBlocks, null);
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final Long timestamp) {
+        return _generateBlocks(privateKeyGenerator, blockCount, blocksDirectory, initBlocks, null, timestamp);
     }
 
-    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator, final Long timestamp) {
         if (blockCount > 0) {
             Logger.debug("Generating " + blockCount + " blocks.");
         }
@@ -188,7 +191,20 @@ public class Main implements AutoCloseable {
             }
         };
 
-        final StratumServer stratumServer = new StratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater);
+        final SystemTime systemTime = new SystemTime() {
+            @Override
+            public Long getCurrentTimeInSeconds() {
+                final int newBlockCount = createdBlocks.getCount();
+                return timestamp + (newBlockCount * 10L * 60L);
+            }
+
+            @Override
+            public Long getCurrentTimeInMilliSeconds() {
+                return (this.getCurrentTimeInSeconds() * 1000L);
+            }
+        };
+
+        final StratumServer stratumServer = new StratumServer(rpcConnectorFactory, 3333, threadPool, masterInflater, systemTime);
         stratumServerContainer.value = stratumServer;
 
         {
@@ -196,14 +212,19 @@ public class Main implements AutoCloseable {
             final BlockHeader previousBlock = initBlocks.get(blocksCount - 1);
             final Sha256Hash previousBlockHash = previousBlock.getHash();
 
+            final NanoTimer nanoTimer = new NanoTimer();
+            nanoTimer.start();
+
             final Long nextBlockHeight = (long) blocksCount;
             // final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
             blockTemplateContainer.value = GenerationUtil.getBlockTemplate(blocksDirectory, previousBlockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, createdBlocks); // _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
 
+            nanoTimer.stop();
+            Logger.debug("Template generated in: " + nanoTimer.getMillisecondsElapsed() + "ms.");
+
             final PrivateKey privateKey = privateKeyGenerator.getCoinbasePrivateKey(nextBlockHeight);
             final Address address = addressInflater.fromPrivateKey(privateKey, true);
             stratumServer.setCoinbaseAddress(address);
-            stratumServer.rebuildBlockTemplate();
         }
 
         if (! blocksDirectory.exists()) { blocksDirectory.mkdirs(); }
@@ -235,7 +256,7 @@ public class Main implements AutoCloseable {
                 difficultyCalculatorContext.addBlock(blockHeader);
 
                 final long blockHeight = ( (initBlockCount - 1) + (createdBlockCount + 1) );
-                Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath());
+                Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath() + " byteCount=" + blockDeflater.getByteCount(block));
 
                 _sendBlock(block, blockHeight, blocksDirectory, true);
 
@@ -519,6 +540,18 @@ public class Main implements AutoCloseable {
         Logger.debug("HeadBlock=" + initBlockHeaders.get(initBlockHeaders.getCount() - 1).getHash());
 
         return new Tuple<>(initBlockHeaders, initBlocks);
+    }
+
+    protected Long _calculateTimestamp(final List<BlockHeader> blockHeaders) {
+        final int blockHeaderCount = blockHeaders.getCount();
+        final BlockHeader blockHeader = blockHeaders.get(blockHeaderCount - 1);
+        final Long timestamp = blockHeader.getTimestamp();
+        if (timestamp < 1640995200L) {
+            return 1651113031L;
+        }
+
+        final long tenMinutes = 10L * 60L;
+        return (timestamp + tenMinutes);
     }
 
     protected void _writeTransactionGenerationOrder(final Transaction transaction, final List<Transaction> transactions, final File defaultScenarioDirectory, final Long blockHeight) {
@@ -823,6 +856,7 @@ public class Main implements AutoCloseable {
         }
         long runningBlockHeight = (blockHeaders.getCount() - 1L);
 
+        final Long firstSpendableCoinbaseBlockHeight = (long) blockHeaders.getCount();
         Logger.info("Generating spendable coinbase blocks: " + runningBlockHeight);
         // final long firstScenarioBlockHeight = blockHeaders.getCount();
         {
@@ -830,7 +864,7 @@ public class Main implements AutoCloseable {
             final MutableList<BlockHeader> scenarioBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
             _sendBlocks(scenarioBlocks, runningBlockHeight, defaultScenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - scenarioBlocks.getCount());
-            scenarioBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders));
+            scenarioBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(scenarioBlocks);
             for (final BlockHeader blockHeader : scenarioBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -895,7 +929,7 @@ public class Main implements AutoCloseable {
                         return null;
                     }
                 }
-            }));
+            }, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(fanOutBlocks);
             for (final BlockHeader blockHeader : fanOutBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -958,7 +992,7 @@ public class Main implements AutoCloseable {
                         return null;
                     }
                 }
-            }));
+            }, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(quasiSteadyStateBlocks);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -1002,7 +1036,7 @@ public class Main implements AutoCloseable {
                         return null;
                     }
                 }
-            }));
+            }, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(fanInBlocks);
             for (final BlockHeader blockHeader : fanInBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -1068,7 +1102,7 @@ public class Main implements AutoCloseable {
                         return null;
                     }
                 }
-            }));
+            }, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(quasiSteadyStateBlocksRoundTwo);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocksRoundTwo) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -1078,32 +1112,67 @@ public class Main implements AutoCloseable {
         }
 
         Logger.info("Generating steady-state blocks: " + runningBlockHeight);
+        // Spends all UTXOs from block# 145, excluding coinbases.
+        // Spends coinbases from 156-160 (inclusive).
         final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
         {
-            final MutableList<TestUtxo> availableUtxos = new MutableList<>();
+            final HashMap<Sha256Hash, HashMap<Integer, TestUtxo>> utxoMap = new HashMap<>();
             {
-                long blockHeight = firstQuasiSteadyStateBlockHeightRoundTwo;
-                for (final BlockHeader blockHeader : quasiSteadyStateBlocksRoundTwo) {
+                long blockHeight = firstSpendableCoinbaseBlockHeight;
+                while (blockHeight < blockHeaders.getCount()) {
+                    // Logger.debug("Loading Block Height: " + blockHeight);
+                    final BlockHeader blockHeader = blockHeaders.get((int) blockHeight);
                     final Block block = DiskUtil.loadBlock(blockHeader.getHash(), defaultScenarioDirectory);
+                    // Logger.debug("Block Hash: " + blockHeader.getHash() + " " + (block != null ? "block" : null));
+
                     boolean isCoinbase = true;
+                    for (final Transaction transaction : block.getTransactions()) {
+                        if (isCoinbase) {
+                            // final boolean isSpendableCoinbase = ((firstSpendableCoinbaseBlockHeight - blockHeight) >= 100L);
+                            isCoinbase = false;
+
+                            // if (! isSpendableCoinbase) { continue; }
+                            continue;
+                        }
+
+                        final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
+                        final int outputCount = transactionOutputs.getCount();
+                        for (int outputIndex = 0; outputIndex < outputCount; ++outputIndex) {
+                            final TestUtxo testUtxo = new TestUtxo(transaction, outputIndex, blockHeight);
+                            final Sha256Hash prevoutHash = transaction.getHash();
+                            if (! utxoMap.containsKey(prevoutHash)) {
+                                utxoMap.put(prevoutHash, new HashMap<>(1));
+                            }
+
+                            final HashMap<Integer, TestUtxo> testUtxos = utxoMap.get(prevoutHash);
+                            testUtxos.put(outputIndex, testUtxo);
+                        }
+                    }
+
+                    isCoinbase = true;
                     for (final Transaction transaction : block.getTransactions()) {
                         if (isCoinbase) {
                             isCoinbase = false;
                             continue;
                         }
 
-                        int outputIndex = 0;
-                        for (final TransactionOutput transactionOutput : transaction.getTransactionOutputs()) {
-                            final Long amount = transactionOutput.getAmount();
-                            final TestUtxo testUtxo = new TestUtxo(transaction, outputIndex, blockHeight);
-                            availableUtxos.add(testUtxo);
+                        for (final TransactionInput transactionInput : transaction.getTransactionInputs()) {
+                            final Sha256Hash prevoutHash = transactionInput.getPreviousOutputTransactionHash();
+                            if (! utxoMap.containsKey(prevoutHash)) { continue; }
 
-                            outputIndex += 1;
+                            final Integer prevoutIndex = transactionInput.getPreviousOutputIndex();
+                            final HashMap<Integer, TestUtxo> utxoSet = utxoMap.get(prevoutHash);
+                            utxoSet.remove(prevoutIndex);
                         }
                     }
 
                     blockHeight += 1L;
                 }
+            }
+
+            final MutableList<TestUtxo> availableUtxos = new MutableList<>(0);
+            for (final HashMap<Integer, TestUtxo> map : utxoMap.values()) {
+                availableUtxos.addAll(map.values());
             }
             Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
@@ -1148,7 +1217,7 @@ public class Main implements AutoCloseable {
                     Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
                     try {
-                        final List<Transaction> generatedTransactions = GenerationUtil.createCashTransactions(availableUtxos, blockHeight);
+                        final List<Transaction> generatedTransactions = GenerationUtil.createCashTransactions(additionalTransactionFromPreviousCoinbase, availableUtxos, blockHeight);
                         _writeTransactionGenerationOrder(additionalTransactionFromPreviousCoinbase, generatedTransactions, defaultScenarioDirectory, blockHeight);
 
                         final MutableList<Transaction> transactions = new MutableList<>(generatedTransactions.getCount() + 1);
@@ -1161,7 +1230,7 @@ public class Main implements AutoCloseable {
                         return null;
                     }
                 }
-            }));
+            }, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(steadyStateBlocks);
             for (final BlockHeader blockHeader : steadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();

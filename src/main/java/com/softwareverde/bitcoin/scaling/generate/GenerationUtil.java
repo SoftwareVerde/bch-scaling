@@ -323,7 +323,7 @@ public class GenerationUtil {
         }
     }
 
-    public static MutableList<Transaction> createCashTransactions(final MutableList<TestUtxo> availableUtxos, final Long blockHeight) throws Exception {
+    public static MutableList<Transaction> createCashTransactions(final Transaction optionalTransaction, final MutableList<TestUtxo> availableUtxos, final Long blockHeight) throws Exception {
         final long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
 
         final AddressInflater addressInflater = new AddressInflater();
@@ -334,7 +334,14 @@ public class GenerationUtil {
         final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
 
         final TransactionDeflater transactionDeflater = new TransactionDeflater();
+
+        final long coinbaseSize = 2048; // Over-estimate.
         long blockSize = (BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT + 8L);
+        blockSize += coinbaseSize;
+
+        if (optionalTransaction != null) {
+            blockSize += transactionDeflater.getByteCount(optionalTransaction);
+        }
 
         // final long defaultMinBalance = 100000L;
         // long minBalance = defaultMinBalance;
