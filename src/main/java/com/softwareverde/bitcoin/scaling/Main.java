@@ -8,6 +8,7 @@ import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
 import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
+import com.softwareverde.bitcoin.block.header.BlockHeaderInflater;
 import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeaderWithTransactionCount;
@@ -37,6 +38,7 @@ import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionInflater;
 import com.softwareverde.bitcoin.transaction.input.TransactionInput;
 import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
+import com.softwareverde.bitcoin.util.ByteUtil;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.Wallet;
 import com.softwareverde.concurrent.ConcurrentHashSet;
@@ -57,7 +59,6 @@ import com.softwareverde.logging.LineNumberAnnotatedLog;
 import com.softwareverde.logging.LogLevel;
 import com.softwareverde.logging.Logger;
 import com.softwareverde.network.p2p.node.Node;
-import com.softwareverde.util.ByteUtil;
 import com.softwareverde.util.Container;
 import com.softwareverde.util.IoUtil;
 import com.softwareverde.util.StringUtil;
@@ -1122,11 +1123,20 @@ public class Main implements AutoCloseable {
                 while (blockHeight < blockHeaders.getCount()) {
                     // Logger.debug("Loading Block Height: " + blockHeight);
                     final BlockHeader blockHeader = blockHeaders.get((int) blockHeight);
-                    final Block block = DiskUtil.loadBlock(blockHeader.getHash(), defaultScenarioDirectory);
+                    final Sha256Hash blockHash = blockHeader.getHash();
+                    final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
                     // Logger.debug("Block Hash: " + blockHeader.getHash() + " " + (block != null ? "block" : null));
+
+                    final Integer transactionCount = block.getTransactionCount();
+                    long nextBlockOffset = BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT;
+
+                    nextBlockOffset += ByteUtil.variableLengthIntegerToBytes(transactionCount).length;
 
                     boolean isCoinbase = true;
                     for (final Transaction transaction : block.getTransactions()) {
+                        final long blockOffset = nextBlockOffset;
+                        nextBlockOffset += transaction.getByteCount();
+
                         if (isCoinbase) {
                             // final boolean isSpendableCoinbase = ((firstSpendableCoinbaseBlockHeight - blockHeight) >= 100L);
                             isCoinbase = false;
@@ -1138,13 +1148,15 @@ public class Main implements AutoCloseable {
                         final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
                         final int outputCount = transactionOutputs.getCount();
                         for (int outputIndex = 0; outputIndex < outputCount; ++outputIndex) {
-                            final TestUtxo testUtxo = new TestUtxo(transaction, outputIndex, blockHeight);
+                            final TestUtxo testUtxo = OnDiskUtxo.fromTransaction(transaction, outputIndex, blockHeight, blockHash, blockOffset, defaultScenarioDirectory);
                             final Sha256Hash prevoutHash = transaction.getHash();
-                            if (! utxoMap.containsKey(prevoutHash)) {
-                                utxoMap.put(prevoutHash, new HashMap<>(1));
+
+                            HashMap<Integer, TestUtxo> testUtxos = utxoMap.get(prevoutHash);
+                            if (testUtxos == null) {
+                                testUtxos = new HashMap<>(1);
+                                utxoMap.put(prevoutHash, testUtxos);
                             }
 
-                            final HashMap<Integer, TestUtxo> testUtxos = utxoMap.get(prevoutHash);
                             testUtxos.put(outputIndex, testUtxo);
                         }
                     }
