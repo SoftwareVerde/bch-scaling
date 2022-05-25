@@ -8,7 +8,9 @@ import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
 import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
+import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
+import com.softwareverde.bitcoin.block.header.ImmutableBlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.inflater.MasterInflater;
 import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnector;
 import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnectorFactory;
@@ -25,15 +27,23 @@ import com.softwareverde.bitcoin.scaling.rpc.BitcoinCoreRpcConnector2;
 import com.softwareverde.bitcoin.scaling.rpc.TransactionRpcConnector;
 import com.softwareverde.bitcoin.scaling.rpc.VerdeTransactionRpcConnector;
 import com.softwareverde.bitcoin.server.main.BitcoinConstants;
+import com.softwareverde.bitcoin.server.message.type.node.feature.LocalNodeFeatures;
+import com.softwareverde.bitcoin.server.message.type.node.feature.NodeFeatures;
+import com.softwareverde.bitcoin.server.message.type.query.response.hash.InventoryItem;
+import com.softwareverde.bitcoin.server.message.type.query.response.hash.InventoryItemType;
+import com.softwareverde.bitcoin.server.node.BitcoinNode;
 import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
 import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionInflater;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.Wallet;
+import com.softwareverde.concurrent.ConcurrentHashSet;
+import com.softwareverde.concurrent.Pin;
 import com.softwareverde.concurrent.threadpool.CachedThreadPool;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.bytearray.MutableByteArray;
 import com.softwareverde.constable.list.List;
+import com.softwareverde.constable.list.immutable.ImmutableList;
 import com.softwareverde.constable.list.mutable.MutableList;
 import com.softwareverde.cryptography.hash.sha256.MutableSha256Hash;
 import com.softwareverde.cryptography.hash.sha256.Sha256Hash;
@@ -44,10 +54,12 @@ import com.softwareverde.json.Json;
 import com.softwareverde.logging.LineNumberAnnotatedLog;
 import com.softwareverde.logging.LogLevel;
 import com.softwareverde.logging.Logger;
+import com.softwareverde.network.p2p.node.Node;
 import com.softwareverde.util.ByteUtil;
 import com.softwareverde.util.Container;
 import com.softwareverde.util.IoUtil;
 import com.softwareverde.util.StringUtil;
+import com.softwareverde.util.Tuple;
 import com.softwareverde.util.Util;
 import com.softwareverde.util.timer.NanoTimer;
 
@@ -55,11 +67,14 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Main {
     public static final Boolean SKIP_SEND = false;
     public static final Boolean SKIP_MINING = true;
     public static final Float PRE_RELAY_PERCENT = 0F;
+    public static final Boolean USE_P2P_BROADCAST = true;
+    public static final Boolean IS_BITCOIN_VERDE_NODE = false;
 
     public static void main(final String[] commandLineArguments) {
         BitcoinConstants.setBlockMaxByteCount((int) (256L * ByteUtil.Unit.Si.MEGABYTES));
@@ -100,93 +115,11 @@ public class Main {
         return PrivateKey.fromBytes(bytes);
     }
 
-    public static MutableList<BlockHeader> generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks) {
-        return Main.generateBlocks(privateKeyGenerator, blockCount, blocksDirectory, initBlocks, null);
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks) {
+        return _generateBlocks(privateKeyGenerator, blockCount, blocksDirectory, initBlocks, null);
     }
 
-    public static void sendBlock(final Block block, final Long blockHeight, final File scenarioDirectory) {
-        final boolean isBitcoinVerdeNode = false;
-        Logger.debug("Starting Transactions: " + block.getHash() + " " + blockHeight);
-        if (SKIP_SEND) { return; }
-
-        final BitcoinNodeRpcAddress rpcAddress;
-        final RpcCredentials rpcCredentials;
-        if (isBitcoinVerdeNode) {
-            rpcAddress = new BitcoinNodeRpcAddress("localhost", 18334);
-            rpcCredentials = null;
-        }
-        else {
-            // bitcoin.conf:
-            //  server=1
-            //  rpcauth=root:b971ece882a77bff1a4803c5e7b418fc$a242915ce44f887e8c28b42cfdd87592d1abffa47084e4fb7718dc982c80636a
-
-            rpcAddress = new BitcoinNodeRpcAddress("localhost", 8332);
-            rpcCredentials = new RpcCredentials("root", "luaDH5Orq8oTJUJhxz2LP4OV1qlCu62OBl26xDhz8Lk=");
-        }
-
-        if ( (blockHeight != null) && (PRE_RELAY_PERCENT > 0F) ) {
-            final File directory = new File(scenarioDirectory, "mempool");
-            final File file = new File(directory, blockHeight + ".sha");
-            if (file.exists()) {
-                final List<Transaction> transactions = block.getTransactions();
-                final HashMap<Sha256Hash, Transaction> transactionHashMap = new HashMap<>(transactions.getCount());
-
-                for (final Transaction transaction : transactions) {
-                    final Sha256Hash transactionHash = transaction.getHash();
-                    transactionHashMap.put(transactionHash, transaction);
-                }
-
-                final int transactionCount = (int) ((transactions.getCount() - 1) * PRE_RELAY_PERCENT);
-                final int seconds = (10 * 60);
-                final int batchSizePerSecond = (transactionCount / seconds);
-                final long delayBetweenTransaction = (transactionCount > 0 ? (1000L / batchSizePerSecond) : 0);
-
-                int sentTransactionsCount = 0;
-                try (final TransactionRpcConnector transactionRpcConnector = (isBitcoinVerdeNode ? new VerdeTransactionRpcConnector(rpcAddress) : new BitcoinCoreRpcConnector2(rpcAddress, rpcCredentials))) {
-                    final MutableSha256Hash transactionHash = new MutableSha256Hash();
-                    try (final FileInputStream inputStream = new FileInputStream(file)) {
-                        while (sentTransactionsCount < transactionCount) {
-                            final NanoTimer nanoTimer = new NanoTimer();
-                            nanoTimer.start();
-
-                            final int readByteCount = inputStream.read(transactionHash.unwrap());
-                            if (readByteCount != Sha256Hash.BYTE_COUNT) { break; }
-
-                            final Transaction transaction = transactionHashMap.get(transactionHash);
-                            if (transaction == null) { continue; }
-
-                            transactionRpcConnector.submitTransaction(transaction);
-                            sentTransactionsCount += 1;
-
-                            nanoTimer.stop();
-
-                            // if (Logger.isDebugEnabled()) {
-                            //     Logger.debug(transaction.getHash() + " - " + nanoTimer.getMillisecondsElapsed() + "ms");
-                            // }
-
-                            final long delayMs = (long) (delayBetweenTransaction - nanoTimer.getMillisecondsElapsed());
-                            if (delayMs >= 1L) {
-                                Thread.sleep(delayMs);
-                            }
-                        }
-                    }
-                }
-                catch (final Exception exception) {
-                    Logger.debug(exception);
-                }
-            }
-        }
-
-        Logger.debug("Sending Full Block: " + block.getHash() + " " + blockHeight);
-
-        try (final BitcoinMiningRpcConnector bitcoinRpcConnector = (isBitcoinVerdeNode ? new BitcoinVerdeRpcConnector(rpcAddress, rpcCredentials) : new BitcoinCoreRpcConnector(rpcAddress, rpcCredentials))) {
-            bitcoinRpcConnector.submitBlock(block);
-        }
-
-        Logger.debug("Sent: " + block.getHash());
-    }
-
-    public static MutableList<BlockHeader> generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
+    protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final TransactionGenerator transactionGenerator) {
         final AddressInflater addressInflater = new AddressInflater();
         final BlockDeflater blockDeflater = new BlockDeflater();
         final MasterInflater masterInflater = new CoreInflater();
@@ -297,7 +230,7 @@ public class Main {
                 final long blockHeight = ( (initBlockCount - 1) + (createdBlockCount + 1) );
                 Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath());
 
-                Main.sendBlock(block, blockHeight, blocksDirectory);
+                _sendBlock(block, blockHeight, blocksDirectory, true);
 
                 if (newCreatedBlockCount >= blockCount) {
                     synchronized (createdBlocks) {
@@ -369,8 +302,175 @@ public class Main {
         return createdBlocks;
     }
 
-    protected MutableList<BlockHeader> _loadInitBlocks(final File blocksBaseDirectory) {
-        final MutableList<BlockHeader> initBlocks = new MutableList<>();
+
+    protected void _sendBlockHeader(final BlockHeader block, final Integer transactionCount) {
+        final Sha256Hash blockHash = block.getHash();
+        _currentBlockHash = blockHash;
+
+        if (SKIP_SEND) {
+            Logger.debug("Skipped Header: " + blockHash);
+            return;
+        }
+
+        final BlockHeaderWithTransactionCount blockHeader = new ImmutableBlockHeaderWithTransactionCount(block, transactionCount);
+        _bitcoinNode.transmitBlockHeader(blockHeader);
+
+        Logger.debug("Sent Header: " + blockHash);
+    }
+
+    protected void _sendBlock(final Block block, final Long blockHeight, final File scenarioDirectory, final Boolean shouldWait) {
+        final Sha256Hash blockHash = block.getHash();
+        // _currentBlockHash = blockHash;
+
+        if (SKIP_SEND) {
+            Logger.debug("Skipped: " + blockHash);
+            return;
+        }
+
+        if ( (blockHeight != null) && (PRE_RELAY_PERCENT > 0F) ) {
+            final File directory = new File(scenarioDirectory, "mempool");
+            final File file = new File(directory, blockHeight + ".sha");
+            if (file.exists()) {
+                final int blockTransactionCount = block.getTransactionCount();
+                final int transactionCount = (int) ((blockTransactionCount - 1) * PRE_RELAY_PERCENT);
+                final int seconds = (10 * 60);
+                final int batchSizePerSecond = (transactionCount / seconds);
+
+                int sentTransactionsCount = 0;
+                if (USE_P2P_BROADCAST) {
+                    _transactionsBeingServed.clear();
+                    for (final Transaction transaction : block.getTransactions()) {
+                        final Sha256Hash transactionHash = transaction.getHash();
+                        _transactionsBeingServed.put(transactionHash, transaction);
+                    }
+
+                    Logger.debug("Starting Transactions: " + blockHash + " " + blockHeight);
+
+                    final MutableByteArray readBuffer = new MutableByteArray(Sha256Hash.BYTE_COUNT);
+                    try (final FileInputStream inputStream = new FileInputStream(file)) {
+                        while (sentTransactionsCount < transactionCount) {
+                            final NanoTimer nanoTimer = new NanoTimer();
+                            nanoTimer.start();
+
+                            final MutableList<Sha256Hash> transactionHashesBatch = new MutableList<>();
+                            for (int i = 0; i < batchSizePerSecond; ++i) {
+                                final int readByteCount = inputStream.read(readBuffer.unwrap());
+                                if (readByteCount != Sha256Hash.BYTE_COUNT) { break; }
+
+                                final Sha256Hash transactionHash = Sha256Hash.copyOf(readBuffer.unwrap());
+                                transactionHashesBatch.add(transactionHash);
+
+                                sentTransactionsCount += 1;
+                            }
+
+                            if (transactionHashesBatch.isEmpty()) { break; }
+
+                            _bitcoinNode.transmitTransactionHashes(transactionHashesBatch);
+
+                            nanoTimer.stop();
+
+                            final long delayMs = (long) (1000L - nanoTimer.getMillisecondsElapsed());
+                            if (delayMs >= 1L) {
+                                Thread.sleep(delayMs);
+                            }
+                        }
+                    }
+                    catch (final Exception exception) {
+                        Logger.debug(exception);
+                    }
+                }
+                else {
+                    final List<Transaction> transactions = block.getTransactions();
+                    final HashMap<Sha256Hash, Transaction> transactionHashMap = new HashMap<>(transactions.getCount());
+
+                    for (final Transaction transaction : transactions) {
+                        final Sha256Hash transactionHash = transaction.getHash();
+                        transactionHashMap.put(transactionHash, transaction);
+                    }
+                    final long delayBetweenTransaction = (transactionCount > 0 ? (1000L / batchSizePerSecond) : 0);
+
+                    try (final TransactionRpcConnector transactionRpcConnector = (IS_BITCOIN_VERDE_NODE ? new VerdeTransactionRpcConnector(_rpcAddress) : new BitcoinCoreRpcConnector2(_rpcAddress, _rpcCredentials))) {
+                        Logger.debug("Starting Transactions: " + blockHash + " " + blockHeight);
+                        final MutableSha256Hash transactionHash = new MutableSha256Hash();
+                        try (final FileInputStream inputStream = new FileInputStream(file)) {
+                            while (sentTransactionsCount < transactionCount) {
+                                final NanoTimer nanoTimer = new NanoTimer();
+                                nanoTimer.start();
+
+                                final int readByteCount = inputStream.read(transactionHash.unwrap());
+                                if (readByteCount != Sha256Hash.BYTE_COUNT) { break; }
+
+                                final Transaction transaction = transactionHashMap.get(transactionHash);
+                                if (transaction == null) { continue; }
+
+                                transactionRpcConnector.submitTransaction(transaction);
+                                sentTransactionsCount += 1;
+
+                                nanoTimer.stop();
+
+                                // if (Logger.isDebugEnabled()) {
+                                //     Logger.debug(transaction.getHash() + " - " + nanoTimer.getMillisecondsElapsed() + "ms");
+                                // }
+
+                                final long delayMs = (long) (delayBetweenTransaction - nanoTimer.getMillisecondsElapsed());
+                                if (delayMs >= 1L) {
+                                    Thread.sleep(delayMs);
+                                }
+                            }
+                        }
+                    }
+                    catch (final Exception exception) {
+                        Logger.debug(exception);
+                    }
+                }
+            }
+        }
+
+        Logger.debug("Sending Full Block: " + blockHash + " " + blockHeight);
+
+        if (USE_P2P_BROADCAST) {
+            // _bitcoinNode.transmitBlockHashes(new ImmutableList<>(blockHash));
+            final Integer transactionCount = block.getTransactionCount();
+            final BlockHeaderWithTransactionCount blockHeader = new ImmutableBlockHeaderWithTransactionCount(block, transactionCount);
+            _bitcoinNode.transmitBlockHeader(blockHeader);
+
+            if (shouldWait) {
+                synchronized (_servedBlocks) {
+                    while (! _servedBlocks.contains(blockHash)) {
+                        try {
+                            _servedBlocks.wait(); // Wait for the block to be downloaded...
+                        }
+                        catch (final Exception exception) {
+                            final Thread thread = Thread.currentThread();
+                            thread.interrupt();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            try (final BitcoinMiningRpcConnector bitcoinRpcConnector = (IS_BITCOIN_VERDE_NODE ? new BitcoinVerdeRpcConnector(_rpcAddress, _rpcCredentials) : new BitcoinCoreRpcConnector(_rpcAddress, _rpcCredentials))) {
+                bitcoinRpcConnector.submitBlock(block);
+            }
+        }
+
+        Logger.debug("Sent: " + blockHash);
+    }
+
+    protected final BitcoinNodeRpcAddress _rpcAddress;
+    protected final RpcCredentials _rpcCredentials;
+    protected final Sha256Hash _genesisBlockHash = Sha256Hash.fromHexString(BitcoinConstants.getGenesisBlockHash());
+    protected CachedThreadPool _threadPool;
+    protected BitcoinNode _bitcoinNode;
+    protected final ConcurrentHashMap<Sha256Hash, Block> _initBlocks = new ConcurrentHashMap<>();
+    protected final ConcurrentHashSet<Sha256Hash> _servedBlocks = new ConcurrentHashSet<>();
+    protected Sha256Hash _currentBlockHash;
+    protected ConcurrentHashMap<Sha256Hash, Transaction> _transactionsBeingServed = new ConcurrentHashMap<>();
+
+    protected Tuple<MutableList<BlockHeader>, MutableList<Block>> _loadInitBlocks(final File blocksBaseDirectory) {
+        final MutableList<BlockHeader> initBlockHeaders = new MutableList<>();
+        final MutableList<Block> initBlocks = new MutableList<>();
 
         final BlockInflater blockInflater = new BlockInflater();
         final Json mainNetBlocks = Json.parse(IoUtil.getResource("/manifest.json")); // Genesis through Block #144 (inclusive)
@@ -400,15 +500,18 @@ public class Main {
             }
 
             final BlockHeader blockHeader = new ImmutableBlockHeader(block);
-            initBlocks.add(blockHeader);
+            initBlockHeaders.add(blockHeader);
+            initBlocks.add(block);
 
-            Main.sendBlock(block, null, null);
+            if (! USE_P2P_BROADCAST) {
+                _sendBlock(block, null, null, false);
+            }
         }
 
-        Logger.debug(initBlocks.getCount() + " blocks loaded.");
-        Logger.debug("HeadBlock=" + initBlocks.get(initBlocks.getCount() - 1).getHash());
+        Logger.debug(initBlockHeaders.getCount() + " blocks loaded.");
+        Logger.debug("HeadBlock=" + initBlockHeaders.get(initBlockHeaders.getCount() - 1).getHash());
 
-        return initBlocks;
+        return new Tuple<>(initBlockHeaders, initBlocks);
     }
 
     protected void _writeTransactionGenerationOrder(final Transaction transaction, final List<Transaction> transactions, final File defaultScenarioDirectory, final Long blockHeight) {
@@ -433,7 +536,21 @@ public class Main {
         }
     }
 
-    public Main() { }
+    public Main() {
+        if (IS_BITCOIN_VERDE_NODE) {
+            _rpcAddress = new BitcoinNodeRpcAddress("localhost", 18334);
+            _rpcCredentials = null;
+        }
+        else {
+            // bitcoin.conf:
+            //  server=1
+            //  index=1
+            //  rpcauth=root:b971ece882a77bff1a4803c5e7b418fc$a242915ce44f887e8c28b42cfdd87592d1abffa47084e4fb7718dc982c80636a
+
+            _rpcAddress = new BitcoinNodeRpcAddress("localhost", 8332);
+            _rpcCredentials = new RpcCredentials("root", "luaDH5Orq8oTJUJhxz2LP4OV1qlCu62OBl26xDhz8Lk=");
+        }
+    }
 
     public void run() {
         final Integer coinbaseMaturityBlockCount = 100;
@@ -441,23 +558,149 @@ public class Main {
         final MutableList<BlockHeader> blockHeaders = new MutableList<>(0);
 
         final File blocksBaseDirectory = new File("data/blocks");
-        final List<BlockHeader> initBlocks = _loadInitBlocks(blocksBaseDirectory);
-        blockHeaders.addAll(initBlocks);
-
         final File defaultScenarioDirectory = new File(blocksBaseDirectory, "default");
+
+        if (USE_P2P_BROADCAST) {
+            _threadPool = new CachedThreadPool(12, 300000L);
+            _threadPool.start();
+
+            final LocalNodeFeatures nodeFeatures = new LocalNodeFeatures() {
+                @Override
+                public NodeFeatures getNodeFeatures() {
+                    final NodeFeatures nodeFeatures = new NodeFeatures();
+                    nodeFeatures.enableFeature(NodeFeatures.Feature.BITCOIN_CASH_ENABLED);
+                    // nodeFeatures.enableFeature(NodeFeatures.Feature.XTHIN_PROTOCOL_ENABLED);
+                    // nodeFeatures.enableFeature(NodeFeatures.Feature.BLOOM_CONNECTIONS_ENABLED);
+
+                    nodeFeatures.enableFeature(NodeFeatures.Feature.BLOCKCHAIN_ENABLED);
+                    nodeFeatures.enableFeature(NodeFeatures.Feature.MINIMUM_OF_TWO_DAYS_BLOCKCHAIN_ENABLED);
+
+                    return nodeFeatures;
+                }
+            };
+
+            final BitcoinNode.RequestDataHandler requestDataHandler = new BitcoinNode.RequestDataHandler() {
+                @Override
+                public void run(final BitcoinNode bitcoinNode, final List<InventoryItem> dataHashes) {
+                    for (final InventoryItem inventoryItem : dataHashes) {
+                        Logger.debug("Node Requested: " + inventoryItem);
+
+                        final InventoryItemType itemType = inventoryItem.getItemType();
+                        if (itemType == InventoryItemType.BLOCK) {
+                            final Sha256Hash blockHash = inventoryItem.getItemHash();
+                            final Block block = Util.coalesce(_initBlocks.get(blockHash), DiskUtil.loadBlock(blockHash, defaultScenarioDirectory));
+                            if (block == null) { continue; }
+
+                            bitcoinNode.transmitBlock(block);
+                            Logger.debug("Served: " + blockHash);
+
+                            synchronized (_servedBlocks) {
+                                _servedBlocks.add(blockHash);
+                                _servedBlocks.notifyAll();
+                            }
+                        }
+                        else if (itemType == InventoryItemType.TRANSACTION) {
+                            final Sha256Hash transactionHash = inventoryItem.getItemHash();
+                            final Transaction transaction = _transactionsBeingServed.get(transactionHash);
+                            if (transaction != null) {
+                                bitcoinNode.transmitTransaction(transaction);
+                                Logger.debug("Served: " + transactionHash);
+                            }
+                        }
+                    }
+                }
+            };
+
+            final BitcoinNode.RequestBlockHeadersHandler requestBlockHeadersHandler = new BitcoinNode.RequestBlockHeadersHandler() {
+                @Override
+                public void run(final BitcoinNode bitcoinNode, final List<Sha256Hash> blockHashes, final Sha256Hash desiredBlockHash) {
+                    final Sha256Hash currentBlock = _currentBlockHash;
+                    if (currentBlock != null) {
+                        _bitcoinNode.transmitBlockFinder(new ImmutableList<>(currentBlock));
+                    }
+                    else {
+                        _bitcoinNode.transmitBlockFinder(new ImmutableList<>(_genesisBlockHash));
+                    }
+                }
+            };
+
+            final Pin pin = new Pin();
+
+            final Node.DisconnectedCallback disconnectedCallback = new Node.DisconnectedCallback() {
+                @Override
+                public void onNodeDisconnected() {
+                    final Long blockHeight = (_bitcoinNode != null ? _bitcoinNode.getBlockHeight() : null);
+                    _bitcoinNode = new BitcoinNode("localhost", 8333, _threadPool, nodeFeatures);
+                    Logger.debug("Connecting to Node: " + _bitcoinNode);
+                    if (blockHeight != null) {
+                        _bitcoinNode.setBlockHeight(blockHeight);
+                    }
+                    _bitcoinNode.setRequestDataHandler(requestDataHandler);
+                    _bitcoinNode.setRequestBlockHeadersHandler(requestBlockHeadersHandler);
+                    _bitcoinNode.setDisconnectedCallback(this);
+                    _bitcoinNode.setHandshakeCompleteCallback(new Node.HandshakeCompleteCallback() {
+                        @Override
+                        public void onHandshakeComplete() {
+                            Logger.debug("Handshake complete.");
+                            pin.release();
+                        }
+                    });
+                    _bitcoinNode.enableNewBlockViaHeaders();
+                    _bitcoinNode.connect();
+                    _bitcoinNode.handshake();
+                }
+            };
+
+            disconnectedCallback.onNodeDisconnected(); // Init _bitcoinNode...
+            pin.waitForRelease();
+        }
+
+        final Tuple<MutableList<BlockHeader>, MutableList<Block>> tuple = _loadInitBlocks(blocksBaseDirectory);
+        final List<BlockHeader> initBlockHeaders = tuple.first;
+        for (final Block block : tuple.second) {
+            final Sha256Hash blockHash = block.getHash();
+            _initBlocks.put(blockHash, block);
+        }
+        blockHeaders.addAll(initBlockHeaders);
+
         final File manifestFile = new File(defaultScenarioDirectory, "manifest.json");
-        final int initBlockCount = initBlocks.getCount();
+        final int initBlockCount = initBlockHeaders.getCount();
         if (manifestFile.exists()) {
-            final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
-            for (int i = 0; i < blocksManifestJson.length(); ++i) {
-                final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
+            if (USE_P2P_BROADCAST) {
 
-                final Long blockHeight = (long) (initBlockCount + i);
-                final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
-                Main.sendBlock(block, blockHeight, defaultScenarioDirectory);
+                _bitcoinNode.transmitBlockHeaders(blockHeaders);
 
-                final BlockHeader blockHeader = new ImmutableBlockHeader(block);
-                blockHeaders.add(blockHeader);
+                final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+                for (int i = 0; i < blocksManifestJson.length(); ++i) {
+                    final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
+
+                    final Long blockHeight = (long) (initBlockCount + i);
+                    final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                    final Boolean shouldWait = (i > 2);
+                    _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                }
+
+                while (true) {
+                    try {
+                        Thread.sleep(1000L);
+                    }
+                    catch (final Exception exception) {
+                        break;
+                    }
+                }
+            }
+            else {
+                final Json blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+                for (int i = 0; i < blocksManifestJson.length(); ++i) {
+                    final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
+
+                    final Long blockHeight = (long) (initBlockCount + i);
+                    final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                    _sendBlock(block, blockHeight, defaultScenarioDirectory, true);
+
+                    final BlockHeader blockHeader = new ImmutableBlockHeader(block);
+                    blockHeaders.add(blockHeader);
+                }
             }
         }
         else {
@@ -472,7 +715,7 @@ public class Main {
 
             Logger.info("Generating spendable coinbase blocks.");
             final Long firstScenarioBlockHeight = (long) blockHeaders.getCount();
-            final MutableList<BlockHeader> scenarioBlocks = Main.generateBlocks(privateKeyGenerator, coinbaseMaturityBlockCount, defaultScenarioDirectory, blockHeaders);
+            final MutableList<BlockHeader> scenarioBlocks = _generateBlocks(privateKeyGenerator, coinbaseMaturityBlockCount, defaultScenarioDirectory, blockHeaders);
             blockHeaders.addAll(scenarioBlocks);
             for (final BlockHeader blockHeader : scenarioBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -481,7 +724,7 @@ public class Main {
 
             Logger.info("Generating fan-out blocks.");
             final Long firstFanOutBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> fanOutBlocks = Main.generateBlocks(privateKeyGenerator, 10, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            final List<BlockHeader> fanOutBlocks = _generateBlocks(privateKeyGenerator, 10, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final long coinbaseToSpendBlockHeight = (blockHeight - coinbaseMaturityBlockCount); // preFanOutBlock...
@@ -539,7 +782,7 @@ public class Main {
 
             Logger.info("Generating steady-state blocks.");
             final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> steadyStateBlocks = Main.generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            final List<BlockHeader> steadyStateBlocks = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
@@ -595,7 +838,7 @@ public class Main {
 
             Logger.info("Generating fan-in blocks.");
             final Long firstFanInBlockHeight = (long) blockHeaders.getCount();
-            final List<BlockHeader> fanInBlocks = Main.generateBlocks(privateKeyGenerator, 2, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            final List<BlockHeader> fanInBlocks = _generateBlocks(privateKeyGenerator, 2, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend;
@@ -632,7 +875,7 @@ public class Main {
 
             Logger.info("Generating 2nd steady-state blocks.");
             final Long firstSteadyStateBlockHeightRoundTwo = (long) blockHeaders.getCount();
-            final List<BlockHeader> steadyStateBlocksRoundTwo = Main.generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
+            final List<BlockHeader> steadyStateBlocksRoundTwo = _generateBlocks(privateKeyGenerator, 5, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
                 public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
                     final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
@@ -688,6 +931,14 @@ public class Main {
             }
 
             IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(manifestJson.toString()));
+        }
+
+        if (_bitcoinNode != null) {
+            _bitcoinNode.disconnect();
+        }
+
+        if (_threadPool != null) {
+            _threadPool.stop();
         }
     }
 }

@@ -2,8 +2,9 @@ package com.softwareverde.bitcoin.scaling;
 
 import com.softwareverde.bitcoin.block.Block;
 import com.softwareverde.bitcoin.block.BlockInflater;
-import com.softwareverde.bitcoin.block.header.BlockHeader;
 import com.softwareverde.bitcoin.block.header.BlockHeaderInflater;
+import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
+import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCountInflater;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.bytearray.MutableByteArray;
 import com.softwareverde.cryptography.hash.sha256.Sha256Hash;
@@ -25,8 +26,8 @@ public class DiskUtil {
         return blockInflater.fromBytes(bytes);
     }
 
-    public static BlockHeader loadBlockHeader(final Sha256Hash blockHash, final File blocksDirectory) {
-        final BlockHeaderInflater blockHeaderInflater = new BlockHeaderInflater();
+    public static BlockHeaderWithTransactionCount loadBlockHeader(final Sha256Hash blockHash, final File blocksDirectory) {
+        final BlockHeaderWithTransactionCountInflater blockHeaderInflater = new BlockHeaderWithTransactionCountInflater();
 
         final String blockHashString = blockHash.toString();
         final File blockFile = new File(blocksDirectory, blockHashString);
