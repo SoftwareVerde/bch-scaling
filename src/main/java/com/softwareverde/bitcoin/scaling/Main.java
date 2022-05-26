@@ -8,7 +8,6 @@ import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
 import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
-import com.softwareverde.bitcoin.block.header.BlockHeaderInflater;
 import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeaderWithTransactionCount;
@@ -37,9 +36,10 @@ import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
 import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionInflater;
 import com.softwareverde.bitcoin.transaction.input.TransactionInput;
-import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
 import com.softwareverde.bitcoin.util.ByteUtil;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
+import com.softwareverde.bitcoin.wallet.SlimWallet;
+import com.softwareverde.bitcoin.wallet.SpendableTransactionOutput;
 import com.softwareverde.bitcoin.wallet.Wallet;
 import com.softwareverde.concurrent.ConcurrentHashSet;
 import com.softwareverde.concurrent.Pin;
@@ -70,9 +70,9 @@ import com.softwareverde.util.type.time.SystemTime;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Main implements AutoCloseable {
@@ -1115,9 +1115,10 @@ public class Main implements AutoCloseable {
         Logger.info("Generating steady-state blocks: " + runningBlockHeight);
         // Spends all UTXOs from block# 145, excluding coinbases.
         // Spends coinbases from 156-160 (inclusive).
+        int unspentOutputCount = 0;
         final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
         {
-            final HashMap<Sha256Hash, HashMap<Integer, TestUtxo>> utxoMap = new HashMap<>();
+            final HashMap<Sha256Hash, MutableList<SpendableTransactionOutput>> utxoMap = new HashMap<>();
             {
                 long blockHeight = firstSpendableCoinbaseBlockHeight;
                 while (blockHeight < blockHeaders.getCount()) {
@@ -1127,16 +1128,8 @@ public class Main implements AutoCloseable {
                     final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
                     // Logger.debug("Block Hash: " + blockHeader.getHash() + " " + (block != null ? "block" : null));
 
-                    final Integer transactionCount = block.getTransactionCount();
-                    long nextBlockOffset = BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT;
-
-                    nextBlockOffset += ByteUtil.variableLengthIntegerToBytes(transactionCount).length;
-
                     boolean isCoinbase = true;
                     for (final Transaction transaction : block.getTransactions()) {
-                        final long blockOffset = nextBlockOffset;
-                        nextBlockOffset += transaction.getByteCount();
-
                         if (isCoinbase) {
                             // final boolean isSpendableCoinbase = ((firstSpendableCoinbaseBlockHeight - blockHeight) >= 100L);
                             isCoinbase = false;
@@ -1145,20 +1138,10 @@ public class Main implements AutoCloseable {
                             continue;
                         }
 
-                        final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
-                        final int outputCount = transactionOutputs.getCount();
-                        for (int outputIndex = 0; outputIndex < outputCount; ++outputIndex) {
-                            final TestUtxo testUtxo = OnDiskUtxo.fromTransaction(transaction, outputIndex, blockHeight, blockHash, blockOffset, defaultScenarioDirectory);
-                            final Sha256Hash prevoutHash = transaction.getHash();
-
-                            HashMap<Integer, TestUtxo> testUtxos = utxoMap.get(prevoutHash);
-                            if (testUtxos == null) {
-                                testUtxos = new HashMap<>(1);
-                                utxoMap.put(prevoutHash, testUtxos);
-                            }
-
-                            testUtxos.put(outputIndex, testUtxo);
-                        }
+                        final MutableList<SpendableTransactionOutput> spendableTransactionOutputs = SlimWallet.getTransactionOutputs(transaction, blockHeight, isCoinbase);
+                        final Sha256Hash transactionHash = transaction.getHash();
+                        utxoMap.put(transactionHash, spendableTransactionOutputs);
+                        unspentOutputCount += spendableTransactionOutputs.getCount();
                     }
 
                     isCoinbase = true;
@@ -1173,8 +1156,9 @@ public class Main implements AutoCloseable {
                             if (! utxoMap.containsKey(prevoutHash)) { continue; }
 
                             final Integer prevoutIndex = transactionInput.getPreviousOutputIndex();
-                            final HashMap<Integer, TestUtxo> utxoSet = utxoMap.get(prevoutHash);
-                            utxoSet.remove(prevoutIndex);
+                            final MutableList<SpendableTransactionOutput> utxoSet = utxoMap.get(prevoutHash);
+                            utxoSet.set(prevoutIndex, null);
+                            unspentOutputCount -= 1;
                         }
                     }
 
@@ -1182,23 +1166,25 @@ public class Main implements AutoCloseable {
                 }
             }
 
-            final MutableList<TestUtxo> availableUtxos = new MutableList<>(0);
-            for (final HashMap<Integer, TestUtxo> map : utxoMap.values()) {
-                availableUtxos.addAll(map.values());
+            final MutableList<SpendableTransactionOutput> availableUtxos = new MutableList<>(unspentOutputCount);
+            for (final MutableList<SpendableTransactionOutput> list : utxoMap.values()) {
+                for (final SpendableTransactionOutput spendableTransactionOutput : list) {
+                    if (spendableTransactionOutput != null) {
+                        availableUtxos.add(spendableTransactionOutput);
+                    }
+                }
             }
             Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
             // Arbitrarily order/mix the UTXOs...
-            final Comparator<TestUtxo> testUtxoComparator = new Comparator<TestUtxo>() {
+            final Comparator<SpendableTransactionOutput> testUtxoComparator = new Comparator<SpendableTransactionOutput>() {
                 @Override
-                public int compare(final TestUtxo testUtxo0, final TestUtxo testUtxo1) {
-                    final Transaction transaction0 = testUtxo0.getTransaction();
-                    final Sha256Hash transactionHash0 = transaction0.getHash();
-                    final long value0 = ByteUtil.byteToLong(transactionHash0.getByte(Sha256Hash.BYTE_COUNT - 1)) + (testUtxo0.getOutputIndex() * testUtxo0.getAmount());
+                public int compare(final SpendableTransactionOutput utxo0, final SpendableTransactionOutput utxo1) {
+                    final Sha256Hash transactionHash0 = utxo0.getTransactionHash();
+                    final long value0 = ByteUtil.byteToLong(transactionHash0.getByte(Sha256Hash.BYTE_COUNT - 1)) + (utxo0.getIndex() * utxo0.getAmount());
 
-                    final Transaction transaction1 = testUtxo1.getTransaction();
-                    final Sha256Hash transactionHash1 = transaction1.getHash();
-                    final long value1 = ByteUtil.byteToLong(transactionHash1.getByte(Sha256Hash.BYTE_COUNT - 1)) + (testUtxo1.getOutputIndex() * testUtxo1.getAmount());
+                    final Sha256Hash transactionHash1 = utxo1.getTransactionHash();
+                    final long value1 = ByteUtil.byteToLong(transactionHash1.getByte(Sha256Hash.BYTE_COUNT - 1)) + (utxo1.getIndex() * utxo1.getAmount());
 
                     return Long.compare(value0, value1);
                 }
@@ -1217,10 +1203,7 @@ public class Main implements AutoCloseable {
                     Logger.debug("Spending Block #" + spendBlockHeight + "'s coinbase.");
                     final Transaction additionalTransactionFromPreviousCoinbase = _splitCoinbaseTransaction(blockHeight, spendBlockHeight, blockHeaders, defaultScenarioDirectory, privateKeyGenerator);
                     { // Add the coinbase UTXOs to the pool.
-                        final List<TransactionOutput> transactionOutputs = additionalTransactionFromPreviousCoinbase.getTransactionOutputs();
-                        for (int outputIndex = 0; outputIndex < transactionOutputs.getCount(); outputIndex += 1) {
-                            availableUtxos.add(new TestUtxo(additionalTransactionFromPreviousCoinbase, outputIndex, blockHeight));
-                        }
+                        availableUtxos.addAll(SlimWallet.getTransactionOutputs(additionalTransactionFromPreviousCoinbase, blockHeight, false));
 
                         // Arbitrarily re-order/mix the UTXOs...
                         availableUtxos.sort(testUtxoComparator);
@@ -1229,7 +1212,15 @@ public class Main implements AutoCloseable {
                     Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
                     try {
-                        final List<Transaction> generatedTransactions = GenerationUtil.createCashTransactions(additionalTransactionFromPreviousCoinbase, availableUtxos, blockHeight);
+                        final ArrayDeque<SpendableTransactionOutput> utxoDeque = new ArrayDeque<>();
+                        for (final SpendableTransactionOutput utxo : availableUtxos) {
+                            utxoDeque.add(utxo);
+                        }
+                        final List<Transaction> generatedTransactions = GenerationUtil.createCashTransactions(additionalTransactionFromPreviousCoinbase, utxoDeque, blockHeight);
+
+                        availableUtxos.clear();
+                        availableUtxos.addAll(utxoDeque);
+
                         _writeTransactionGenerationOrder(additionalTransactionFromPreviousCoinbase, generatedTransactions, defaultScenarioDirectory, blockHeight);
 
                         final MutableList<Transaction> transactions = new MutableList<>(generatedTransactions.getCount() + 1);

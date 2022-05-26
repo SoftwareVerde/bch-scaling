@@ -14,7 +14,6 @@ import com.softwareverde.bitcoin.rpc.BlockTemplate;
 import com.softwareverde.bitcoin.rpc.MutableBlockTemplate;
 import com.softwareverde.bitcoin.scaling.Main;
 import com.softwareverde.bitcoin.scaling.PrivateTestNetDifficultyCalculatorContext;
-import com.softwareverde.bitcoin.scaling.TestUtxo;
 import com.softwareverde.bitcoin.scaling.TransactionGenerator;
 import com.softwareverde.bitcoin.scaling.TransactionWithBlockHeight;
 import com.softwareverde.bitcoin.server.database.BatchRunner;
@@ -23,9 +22,11 @@ import com.softwareverde.bitcoin.transaction.TransactionDeflater;
 import com.softwareverde.bitcoin.transaction.coinbase.CoinbaseTransaction;
 import com.softwareverde.bitcoin.transaction.input.TransactionInput;
 import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
-import com.softwareverde.bitcoin.transaction.output.identifier.TransactionOutputIdentifier;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
+import com.softwareverde.bitcoin.wallet.SlimWallet;
+import com.softwareverde.bitcoin.wallet.SpendableTransactionOutput;
 import com.softwareverde.bitcoin.wallet.Wallet;
+import com.softwareverde.bitcoin.wallet.WalletUtxo;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.list.List;
 import com.softwareverde.constable.list.immutable.ImmutableList;
@@ -41,7 +42,7 @@ import com.softwareverde.util.timer.NanoTimer;
 import com.softwareverde.util.type.time.SystemTime;
 
 import java.io.File;
-import java.util.HashSet;
+import java.util.Deque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -323,7 +324,7 @@ public class GenerationUtil {
         }
     }
 
-    public static MutableList<Transaction> createCashTransactions(final Transaction optionalTransaction, final MutableList<TestUtxo> availableUtxos, final Long blockHeight) throws Exception {
+    public static MutableList<Transaction> createCashTransactions(final Transaction optionalTransaction, final Deque<SpendableTransactionOutput> availableUtxos, final Long blockHeight) throws Exception {
         final long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
 
         final AddressInflater addressInflater = new AddressInflater();
@@ -347,40 +348,46 @@ public class GenerationUtil {
         // long minBalance = defaultMinBalance;
         final long minBalance = 100000L;
 
-        long availableBalance = 0L;
-        for (final TestUtxo testUtxo : availableUtxos) {
-            availableBalance += testUtxo.getAmount();
-        }
-        Logger.debug(availableUtxos.getCount() + " UTXOs available, with " + availableBalance + " satoshis total available.");
+        // long availableBalance = 0L;
+        // for (final SpendableTransactionOutput spendableTransactionOutput : availableUtxos) {
+        //     availableBalance += spendableTransactionOutput.getAmount();
+        // }
+        // Logger.debug(availableUtxos.getCount() + " UTXOs available, with " + availableBalance + " satoshis total available.");
+        Logger.debug(availableUtxos.size() + " UTXOs available.");
 
+        final Address tempChangeAddress;
+        {
+            final PrivateKey privateKey = PrivateKey.fromHexString("0000000000000000000000000000000000000000000000000000000000000001");
+            tempChangeAddress = addressInflater.fromPrivateKey(privateKey, true);
+        }
+
+        int iterationCount = 0;
         int unspendableCount = 0;
         while (blockSize < maxBlockSize) {
+            iterationCount += 1;
+            if (iterationCount % 1024 == 0) {
+                Logger.debug("iterationCount=" + iterationCount + " blockSize=" + blockSize + " availableUtxos.count=" + availableUtxos.size()); // + " transactions.count=" + transactions.size());
+            }
+
             if (availableUtxos.isEmpty()) { break; }
 
             final long minOutputAmount = 546;
 
-            final DebugWallet wallet = new DebugWallet();
-            wallet.setSatoshisPerByteFee(1D);
+            final SlimWallet wallet = new SlimWallet();
 
-            final MutableList<TransactionOutputIdentifier> outputIdentifiersToSpend = new MutableList<>();
-            final HashSet<TransactionOutputIdentifier> outputsConsideredSpent = new HashSet<>();
-            final MutableList<TestUtxo> testUtxos = new MutableList<>();
             int outputsToSpendCount = 0;
             long spendableWalletBalance = 0L;
             while ((spendableWalletBalance < minBalance) || (outputsToSpendCount < 2)) {
                 if (availableUtxos.isEmpty()) { break; }
 
-                final TestUtxo testUtxo = availableUtxos.remove(0);
-                final PrivateKey privateKey = Main.derivePrivateKey(testUtxo.getBlockHeight(), testUtxo.getAmount());
-
-                final Transaction transaction = testUtxo.getTransaction();
+                final SpendableTransactionOutput spendableTransactionOutput = availableUtxos.removeFirst();
+                final PrivateKey privateKey = Main.derivePrivateKey(spendableTransactionOutput.getBlockHeight(), spendableTransactionOutput.getAmount());
 
                 final boolean isSpendable;
                 {
-                    final Integer outputIndex = testUtxo.getOutputIndex();
-                    final Wallet isSpendableWallet = new Wallet();
+                    final SlimWallet isSpendableWallet = new SlimWallet();
                     isSpendableWallet.addPrivateKey(privateKey);
-                    isSpendableWallet.addTransaction(transaction, new ImmutableList<>(outputIndex));
+                    isSpendableWallet.addUnspentTransactionOutput(spendableTransactionOutput);
                     isSpendable = (isSpendableWallet.getBalance() > 0L);
                 }
                 if (! isSpendable) {
@@ -389,41 +396,17 @@ public class GenerationUtil {
                 }
 
                 wallet.addPrivateKey(privateKey);
-                spendableWalletBalance += testUtxo.getAmount();
+                spendableWalletBalance += spendableTransactionOutput.getAmount();
 
-                final TransactionOutputIdentifier utxoOutputIdentifier = new TransactionOutputIdentifier(transaction.getHash(), testUtxo.getOutputIndex());
-                outputIdentifiersToSpend.add(utxoOutputIdentifier);
-
-                if (outputsConsideredSpent.contains(utxoOutputIdentifier)) {
-                    outputsConsideredSpent.remove(utxoOutputIdentifier);
-                }
-                else {
-                    final MutableList<TransactionOutputIdentifier> allTransactionOutputIdentifiers = TransactionOutputIdentifier.fromTransactionOutputs(transaction);
-                    final int listIndex = allTransactionOutputIdentifiers.indexOf(utxoOutputIdentifier);
-                    allTransactionOutputIdentifiers.remove(listIndex);
-                    for (final TransactionOutputIdentifier transactionOutputIdentifier : allTransactionOutputIdentifiers) {
-                        outputsConsideredSpent.add(transactionOutputIdentifier);
-                    }
-
-                    wallet.addTransaction(transaction);
-                }
+                wallet.addUnspentTransactionOutput(spendableTransactionOutput);
 
                 outputsToSpendCount += 1;
-                testUtxos.add(testUtxo);
-            }
-            for (final TransactionOutputIdentifier transactionOutputIdentifier : outputsConsideredSpent) {
-                final Sha256Hash transactionHash = transactionOutputIdentifier.getTransactionHash();
-                final Integer outputIndex = transactionOutputIdentifier.getOutputIndex();
-                wallet.markTransactionOutputAsSpent(transactionHash, outputIndex);
             }
 
             if (wallet.getBalance() < minBalance) {
                 Logger.debug("Unable to load min balance: " + wallet.getBalance());
-                wallet.debugWalletState();
                 continue;
             }
-
-            // long fee = wallet.calculateFees(2, outputsToSpendCount);
 
             Transaction transaction = null;
             while (true) {
@@ -440,13 +423,7 @@ public class GenerationUtil {
                     paymentAmounts.add(new PaymentAmount(address, amount));
                 }
 
-                final Address tempChangeAddress;
-                {
-                    final PrivateKey privateKey = PrivateKey.fromHexString("0000000000000000000000000000000000000000000000000000000000000001");
-                    tempChangeAddress = addressInflater.fromPrivateKey(privateKey, true);
-                }
-
-                final Transaction tempTransaction = wallet.createTransaction(paymentAmounts, tempChangeAddress, outputIdentifiersToSpend);
+                final Transaction tempTransaction = wallet.createTransaction(paymentAmounts, tempChangeAddress);
                 if (tempTransaction == null) { break; }
 
                 final Address changeAddress;
@@ -456,7 +433,7 @@ public class GenerationUtil {
                     changeAddress = addressInflater.fromPrivateKey(privateKey, true);
                 }
 
-                transaction = wallet.createTransaction(paymentAmounts, changeAddress, outputIdentifiersToSpend);
+                transaction = wallet.createTransaction(paymentAmounts, changeAddress);
                 if (transaction != null) {
                     final List<TransactionInput> transactionInputs = transaction.getTransactionInputs();
                     final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
@@ -479,22 +456,22 @@ public class GenerationUtil {
             }
 
             if (transaction == null) {
-                // minBalance += defaultMinBalance;
-
-                for (final TestUtxo testUtxo : testUtxos) {
-                    availableUtxos.add(testUtxo);
+                for (final SpendableTransactionOutput spendableTransactionOutput : wallet.getUnspentTransactionOutputs()) {
+                    // availableUtxos.addAll(wallet.getUnspentTransactionOutputs());
+                    availableUtxos.add(spendableTransactionOutput);
                 }
-
                 break;
             }
 
+            final Sha256Hash transactionHash = transaction.getHash();
             final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
             for (int i = 0; i < transactionOutputs.getCount(); ++i) {
-                final TestUtxo utxo = new TestUtxo(transaction, i, blockHeight);
+                final TransactionOutput transactionOutput = transactionOutputs.get(i);
+                final SpendableTransactionOutput utxo = new WalletUtxo(transactionOutput, transactionHash, blockHeight, false);
                 availableUtxos.add(utxo);
             }
 
-            final Integer byteCount = transactionDeflater.getByteCount(transaction);
+            final Integer byteCount = transaction.getByteCount(); // transactionDeflater.getByteCount(transaction);
             blockSize += byteCount;
             if (blockSize >= maxBlockSize) {
                 Logger.debug("Max block size reached: " + blockSize + " of " + maxBlockSize);
