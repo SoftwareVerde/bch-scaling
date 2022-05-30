@@ -463,22 +463,23 @@ public class GenerationUtil {
                 break;
             }
 
-            final Sha256Hash transactionHash = transaction.getHash();
-            final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
-            for (int i = 0; i < transactionOutputs.getCount(); ++i) {
-                final TransactionOutput transactionOutput = transactionOutputs.get(i);
-                final SpendableTransactionOutput utxo = new WalletUtxo(transactionOutput, transactionHash, blockHeight, false);
-                availableUtxos.add(utxo);
-            }
-
-            final Integer byteCount = transaction.getByteCount(); // transactionDeflater.getByteCount(transaction);
-            blockSize += byteCount;
-            if (blockSize >= maxBlockSize) {
+            final Integer byteCount = transaction.getByteCount();
+            if ((blockSize + byteCount) >= maxBlockSize) {
                 Logger.debug("Max block size reached: " + blockSize + " of " + maxBlockSize);
                 break;
             }
             else {
+                blockSize += byteCount;
                 transactions.add(transaction);
+
+                // Add the UTXOs from this transaction into the UTXO pool...
+                final Sha256Hash transactionHash = transaction.getHash();
+                final List<TransactionOutput> transactionOutputs = transaction.getTransactionOutputs();
+                for (int i = 0; i < transactionOutputs.getCount(); ++i) {
+                    final TransactionOutput transactionOutput = transactionOutputs.get(i);
+                    final SpendableTransactionOutput utxo = new WalletUtxo(transactionOutput, transactionHash, blockHeight, false);
+                    availableUtxos.add(utxo);
+                }
             }
         }
 
