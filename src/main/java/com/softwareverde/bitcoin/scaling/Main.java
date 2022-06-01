@@ -77,9 +77,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class Main implements AutoCloseable {
     public static final Boolean SKIP_SEND = false;
-    public static final Boolean SKIP_MINING = false;
-    public static final Float PRE_RELAY_PERCENT = 0F;
-    public static final Boolean USE_P2P_BROADCAST = false;
+    public static final Boolean SKIP_MINING = true;
+    public static final Float PRE_RELAY_PERCENT = 0.90F;
+    public static final Boolean USE_P2P_BROADCAST = true;
     public static final Boolean IS_BITCOIN_VERDE_NODE = false;
 
     public static void main(final String[] commandLineArguments) {
@@ -454,6 +454,18 @@ public class Main implements AutoCloseable {
                 }
             }
         }
+        else if (shouldWait) {
+            final SystemTime systemTime = new SystemTime();
+            final long diffTime = (block.getTimestamp() - systemTime.getCurrentTimeInSeconds());
+            if (diffTime > 0L) {
+                try {
+                    Thread.sleep(diffTime * 1000L);
+                }
+                catch (final Exception exception) {
+                    // Nothing.
+                }
+            }
+        }
 
         Logger.debug("Sending Full Block: " + blockHash + " " + blockHeight);
 
@@ -669,6 +681,7 @@ public class Main implements AutoCloseable {
             //  server=1
             //  txindex=1
             //  zmqpubhashblock=tcp://0.0.0.0:8433
+            //  minrelaytxfee=0 // Requires custom BCHN code.
             //  rpcauth=root:b971ece882a77bff1a4803c5e7b418fc$a242915ce44f887e8c28b42cfdd87592d1abffa47084e4fb7718dc982c80636a
 
             _rpcAddress = new BitcoinNodeRpcAddress("localhost", 8332);
