@@ -6,11 +6,13 @@ import com.softwareverde.bitcoin.address.AddressInflater;
 import com.softwareverde.bitcoin.block.Block;
 import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
+import com.softwareverde.bitcoin.block.CanonicalMutableBlock;
 import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
 import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeaderWithTransactionCount;
+import com.softwareverde.bitcoin.block.header.difficulty.Difficulty;
 import com.softwareverde.bitcoin.inflater.MasterInflater;
 import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnector;
 import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnectorFactory;
@@ -33,9 +35,14 @@ import com.softwareverde.bitcoin.server.message.type.query.response.hash.Invento
 import com.softwareverde.bitcoin.server.message.type.query.response.hash.InventoryItemType;
 import com.softwareverde.bitcoin.server.node.BitcoinNode;
 import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
+import com.softwareverde.bitcoin.transaction.MutableTransaction;
 import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionInflater;
+import com.softwareverde.bitcoin.transaction.input.MutableTransactionInput;
 import com.softwareverde.bitcoin.transaction.input.TransactionInput;
+import com.softwareverde.bitcoin.transaction.script.opcode.PushOperation;
+import com.softwareverde.bitcoin.transaction.script.stack.Value;
+import com.softwareverde.bitcoin.transaction.script.unlocking.MutableUnlockingScript;
 import com.softwareverde.bitcoin.util.ByteUtil;
 import com.softwareverde.bitcoin.wallet.PaymentAmount;
 import com.softwareverde.bitcoin.wallet.SlimWallet;
@@ -70,9 +77,11 @@ import com.softwareverde.util.type.time.SystemTime;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Main implements AutoCloseable {
@@ -801,13 +810,17 @@ public class Main implements AutoCloseable {
         blockHeaders.addAll(initBlockHeaders);
 
         final File manifestFile = new File(defaultScenarioDirectory, "manifest.json");
+        final Json reorgBlocksManifestJson;
         final Json blocksManifestJson;
         final Integer manifestBlockCount;
         if (manifestFile.exists()) {
-            blocksManifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+            final Json manifestJson = Json.parse(StringUtil.bytesToString(IoUtil.getFileContents(manifestFile)));
+            blocksManifestJson = manifestJson.get("blocks");
+            reorgBlocksManifestJson = manifestJson.get("reorgBlocks");
             manifestBlockCount = blocksManifestJson.length();
         }
         else {
+            reorgBlocksManifestJson = null;
             blocksManifestJson = null;
             manifestBlockCount = 0;
         }
@@ -822,9 +835,22 @@ public class Main implements AutoCloseable {
                     final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
 
                     final Long blockHeight = (long) (initBlockCount + i);
-                    final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
-                    final Boolean shouldWait = (i > 2);
-                    _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                    if (reorgBlocksManifestJson.hasKey(blockHeight.toString())) {
+                        final Json reorgBlockHashesJson = reorgBlocksManifestJson.get(blockHeight.toString());
+                        for (int j = 0; j < reorgBlockHashesJson.length(); ++j) {
+                            final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                            final Boolean shouldWait = (i > 2);
+                            _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                        }
+
+                        final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                        _sendBlock(block, blockHeight, defaultScenarioDirectory, false); // Override shouldWait since it was reorged...
+                    }
+                    else {
+                        final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                        final Boolean shouldWait = (i > 2);
+                        _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                    }
                 }
 
                 while (true) {
@@ -1255,7 +1281,12 @@ public class Main implements AutoCloseable {
             runningBlockHeight += steadyStateBlocks.getCount();
         }
 
-        IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(newManifestJson.toString()));
+        final Json json = new Json();
+        json.put("blocks", newManifestJson);
+        if (reorgBlocksManifestJson != null) {
+            json.put("reorgBlocks", reorgBlocksManifestJson);
+        }
+        IoUtil.putFileContents(manifestFile, StringUtil.stringToBytes(json.toString()));
     }
 
     @Override
@@ -1266,6 +1297,123 @@ public class Main implements AutoCloseable {
 
         if (_threadPool != null) {
             _threadPool.stop();
+        }
+    }
+
+    public void createReorgBlock(final Sha256Hash blockHash, final Long blockHeight, final File defaultDirectory) throws Exception {
+        final HashSet<Sha256Hash> blockTransactions = new HashSet<>();
+        {
+            final Block block = DiskUtil.loadBlock(blockHash, defaultDirectory);
+
+            final CanonicalMutableBlock mutableBlock = new CanonicalMutableBlock(block);
+
+            // chainedTransactionHashes should contain any transactions that must not be removed from the block because they are depended on by another transaction within that block...
+            final HashSet<Sha256Hash> chainedTransactionHashes = new HashSet<>();
+            // chainedTransactionHashes.add(Sha256Hash.fromHexString("ABC1F2D110B6F351DD637195543BD7E6034C419E8F76834DF950108865B4EDE1"));
+
+            final int transactionCount = mutableBlock.getTransactionCount();
+            final int txToRemoveCount = (int) (0.005 * transactionCount);
+            int ix = (transactionCount - 1);
+            int removedCount = 0;
+            while (removedCount < txToRemoveCount) {
+                final List<Transaction> transactions = mutableBlock.getTransactions();
+                final Sha256Hash txHash = transactions.get(ix).getHash();
+                if (! chainedTransactionHashes.contains(txHash)) { // if (! Util.areEqual(txHash, chainedTransactionHash)) {
+                    mutableBlock.removeTransaction(txHash);
+                    removedCount += 1;
+                }
+                ix -= 1;
+            }
+            System.out.println("Removed " + removedCount + " transactions.");
+
+            boolean isCoinbase = true;
+            for (final Transaction transaction : mutableBlock.getTransactions()) {
+                if (isCoinbase) {
+                    isCoinbase = false;
+                    continue;
+                }
+                blockTransactions.add(transaction.getHash());
+            }
+
+            final MutableTransaction coinbaseTransaction = new MutableTransaction(mutableBlock.getCoinbaseTransaction());
+            final MutableTransactionInput transactionInput = new MutableTransactionInput(coinbaseTransaction.getTransactionInputs().get(0));
+            final MutableUnlockingScript unlockingScript = new MutableUnlockingScript(transactionInput.getUnlockingScript());
+
+            long nonce = 0L;
+            long extraNonce = 1L;
+
+            final NanoTimer nanoTimer = new NanoTimer();
+            nanoTimer.start();
+
+            final Difficulty difficulty = mutableBlock.getDifficulty();
+            while (true) {
+                final boolean rebuildCoinbase;
+                if (nonce >= Integer.MAX_VALUE - 1L) {
+                    rebuildCoinbase = true;
+                    nonce = 0L;
+                    extraNonce += 1L;
+                }
+                else {
+                    rebuildCoinbase = false;
+                    nonce += 1L;
+                }
+
+                final Sha256Hash newBlockHash = mutableBlock.getHash();
+
+                if (nonce % 1000000 == 0) {
+                    final Double msElapsed = nanoTimer.getMillisecondsElapsed();
+                    final BigInteger bigInteger = BigInteger.valueOf(nonce).multiply(BigInteger.valueOf(extraNonce));
+                    System.out.println(bigInteger + " hashes in " + msElapsed + " (" + (bigInteger.divide(BigInteger.valueOf(msElapsed.longValue()))) + "h/s) " + newBlockHash + " " + difficulty.getDifficultyRatio());
+                }
+
+                if (difficulty.isSatisfiedBy(newBlockHash)) {
+                    final BlockDeflater blockDeflater = new BlockDeflater();
+                    final ByteArray blockBytes = blockDeflater.toBytes(mutableBlock);
+
+                    final File outputFile = new File(defaultDirectory, newBlockHash.toString());
+                    IoUtil.putFileContents(outputFile, blockBytes);
+
+                    System.out.println(outputFile.getAbsolutePath());
+                    break;
+                }
+
+                if (rebuildCoinbase) {
+                    unlockingScript.removeOperation(3);
+                    unlockingScript.addOperation(PushOperation.pushValue(Value.fromInteger(extraNonce)));
+                    transactionInput.setUnlockingScript(unlockingScript);
+                    coinbaseTransaction.setTransactionInput(0, transactionInput);
+                    mutableBlock.replaceTransaction(0, coinbaseTransaction);
+                }
+                mutableBlock.setNonce(nonce);
+            }
+        }
+
+        final File mempoolInputFile;
+        {
+            mempoolInputFile = new File(defaultDirectory, "/mempool/" + blockHeight + "-main-chain.sha");
+            final File originalFile = new File(defaultDirectory, "/mempool/" + blockHeight + ".sha");
+            originalFile.renameTo(mempoolInputFile);
+        }
+
+        final File mempoolOutputFile = new File(defaultDirectory, "/mempool/" + blockHeight + ".sha");
+        final MutableByteArray readBuffer = new MutableByteArray(Sha256Hash.BYTE_COUNT);
+        try (
+            final FileInputStream inputStream = new FileInputStream(mempoolInputFile);
+            final FileOutputStream outputStream = new FileOutputStream(mempoolOutputFile)
+        ) {
+            while (true) {
+                final int readByteCount = inputStream.read(readBuffer.unwrap());
+                if (readByteCount != Sha256Hash.BYTE_COUNT) { break; }
+
+                final Sha256Hash transactionHash = Sha256Hash.copyOf(readBuffer.unwrap());
+                if (blockTransactions.contains(transactionHash)) {
+                    outputStream.write(readBuffer.unwrap());
+                }
+            }
+            outputStream.flush();
+        }
+        catch (final Exception exception) {
+            Logger.debug(exception);
         }
     }
 }
