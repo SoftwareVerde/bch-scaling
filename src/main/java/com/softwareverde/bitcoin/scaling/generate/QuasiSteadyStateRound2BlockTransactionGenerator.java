@@ -12,7 +12,7 @@ import com.softwareverde.logging.Logger;
 
 import java.io.File;
 
-public class QuasiSteadyStateRound2BlockTransactionGenerator extends TransactionGenerator {
+public class QuasiSteadyStateRound2BlockTransactionGenerator extends QuasiSteadyStateBlockTransactionGenerator {
     protected long _startingBlockHeight;
     protected long _firstFanInBlockHeight;
     protected long _firstFanOutBlockHeight;
@@ -25,7 +25,7 @@ public class QuasiSteadyStateRound2BlockTransactionGenerator extends Transaction
     }
 
     @Override
-    public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> existingBlockHeaders, final List<BlockHeader> createdBlocks) {
+    protected List<TransactionWithBlockHeight> _collectTransactionsToSpend(final Long blockHeight, final List<BlockHeader> existingBlockHeaders, final List<BlockHeader> createdBlocks) {
         final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
         {
             final int steadyStateBlockIndex = (int) (blockHeight - _startingBlockHeight); // the Nth of 5 steady state blocks...
@@ -60,15 +60,6 @@ public class QuasiSteadyStateRound2BlockTransactionGenerator extends Transaction
                 }
             }
         }
-
-        try {
-            final List<Transaction> transactions = GenerationUtil.createQuasiSteadyStateTransactions(transactionsToSpend, blockHeight);
-            _writeTransactionGenerationOrder(null, transactions, _scenarioDirectory, blockHeight);
-            return transactions;
-        }
-        catch (final Exception exception) {
-            Logger.warn(exception);
-            return null;
-        }
+        return transactionsToSpend;
     }
 }

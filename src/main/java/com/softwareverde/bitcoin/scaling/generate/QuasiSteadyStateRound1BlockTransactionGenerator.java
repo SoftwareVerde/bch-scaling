@@ -1,18 +1,31 @@
 package com.softwareverde.bitcoin.scaling.generate;
 
+import com.softwareverde.bitcoin.address.Address;
+import com.softwareverde.bitcoin.address.AddressInflater;
 import com.softwareverde.bitcoin.block.Block;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
+import com.softwareverde.bitcoin.block.header.BlockHeaderInflater;
 import com.softwareverde.bitcoin.scaling.DiskUtil;
 import com.softwareverde.bitcoin.scaling.Main;
+import com.softwareverde.bitcoin.server.database.BatchRunner;
 import com.softwareverde.bitcoin.transaction.Transaction;
+import com.softwareverde.bitcoin.transaction.TransactionDeflater;
+import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
+import com.softwareverde.bitcoin.wallet.PaymentAmount;
+import com.softwareverde.bitcoin.wallet.Wallet;
 import com.softwareverde.constable.list.List;
 import com.softwareverde.constable.list.mutable.MutableList;
 import com.softwareverde.cryptography.hash.sha256.Sha256Hash;
+import com.softwareverde.cryptography.secp256k1.key.PrivateKey;
 import com.softwareverde.logging.Logger;
+import com.softwareverde.util.ByteUtil;
+import com.softwareverde.util.timer.NanoTimer;
 
 import java.io.File;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
-public class QuasiSteadyStateRound1BlockTransactionGenerator extends TransactionGenerator {
+public class QuasiSteadyStateRound1BlockTransactionGenerator extends QuasiSteadyStateBlockTransactionGenerator {
     protected long _startingBlockHeight;
     protected long _startingBlockHeightToSpend;
 
@@ -23,7 +36,7 @@ public class QuasiSteadyStateRound1BlockTransactionGenerator extends Transaction
     }
 
     @Override
-    public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> existingBlockHeaders, final List<BlockHeader> createdBlocks) {
+    protected List<TransactionWithBlockHeight> _collectTransactionsToSpend(final Long blockHeight, final List<BlockHeader> existingBlockHeaders, final List<BlockHeader> createdBlocks) {
         final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
         {
             final StringBuilder stringBuilder = new StringBuilder("blockHeight=" + blockHeight);
@@ -57,15 +70,6 @@ public class QuasiSteadyStateRound1BlockTransactionGenerator extends Transaction
             // Logger.debug(stringBuilder);
         }
         // Logger.debug("transactionsToSpend.count=" + transactionsToSpend.getCount());
-
-        try {
-            final List<Transaction> transactions = GenerationUtil.createQuasiSteadyStateTransactions(transactionsToSpend, blockHeight);
-            _writeTransactionGenerationOrder(null, transactions, _scenarioDirectory, blockHeight);
-            return transactions;
-        }
-        catch (final Exception exception) {
-            Logger.warn(exception);
-            return null;
-        }
+        return transactionsToSpend;
     }
 }

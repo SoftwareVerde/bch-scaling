@@ -1,63 +1,18 @@
 package com.softwareverde.bitcoin.scaling;
 
-import com.softwareverde.bitcoin.CoreInflater;
-import com.softwareverde.bitcoin.address.Address;
-import com.softwareverde.bitcoin.address.AddressInflater;
 import com.softwareverde.bitcoin.block.Block;
-import com.softwareverde.bitcoin.block.BlockDeflater;
 import com.softwareverde.bitcoin.block.BlockInflater;
-import com.softwareverde.bitcoin.block.CanonicalMutableBlock;
-import com.softwareverde.bitcoin.block.MutableBlock;
 import com.softwareverde.bitcoin.block.header.BlockHeader;
-import com.softwareverde.bitcoin.block.header.BlockHeaderWithTransactionCount;
 import com.softwareverde.bitcoin.block.header.ImmutableBlockHeader;
-import com.softwareverde.bitcoin.block.header.ImmutableBlockHeaderWithTransactionCount;
-import com.softwareverde.bitcoin.block.header.difficulty.Difficulty;
-import com.softwareverde.bitcoin.inflater.MasterInflater;
-import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnector;
-import com.softwareverde.bitcoin.rpc.BitcoinMiningRpcConnectorFactory;
 import com.softwareverde.bitcoin.rpc.BitcoinNodeRpcAddress;
-import com.softwareverde.bitcoin.rpc.BitcoinVerdeRpcConnector;
-import com.softwareverde.bitcoin.rpc.BlockTemplate;
 import com.softwareverde.bitcoin.rpc.RpcCredentials;
-import com.softwareverde.bitcoin.rpc.core.BitcoinCoreRpcConnector;
-import com.softwareverde.bitcoin.rpc.monitor.Monitor;
-import com.softwareverde.bitcoin.scaling.generate.GenerationUtil;
-import com.softwareverde.bitcoin.scaling.generate.StratumServer;
 import com.softwareverde.bitcoin.scaling.generate.TestBlockMiner;
-import com.softwareverde.bitcoin.scaling.generate.rpc.PrivateTestNetBitcoinMiningRpcConnector;
-import com.softwareverde.bitcoin.scaling.rpc.BitcoinCoreRpcConnector2;
-import com.softwareverde.bitcoin.scaling.rpc.TransactionRpcConnector;
-import com.softwareverde.bitcoin.scaling.rpc.VerdeTransactionRpcConnector;
 import com.softwareverde.bitcoin.server.main.BitcoinConstants;
-import com.softwareverde.bitcoin.server.message.type.node.feature.LocalNodeFeatures;
-import com.softwareverde.bitcoin.server.message.type.node.feature.NodeFeatures;
-import com.softwareverde.bitcoin.server.message.type.query.response.hash.InventoryItem;
-import com.softwareverde.bitcoin.server.message.type.query.response.hash.InventoryItemType;
-import com.softwareverde.bitcoin.server.node.BitcoinNode;
-import com.softwareverde.bitcoin.stratum.callback.BlockFoundCallback;
-import com.softwareverde.bitcoin.transaction.MutableTransaction;
-import com.softwareverde.bitcoin.transaction.Transaction;
-import com.softwareverde.bitcoin.transaction.TransactionInflater;
-import com.softwareverde.bitcoin.transaction.input.MutableTransactionInput;
-import com.softwareverde.bitcoin.transaction.input.TransactionInput;
-import com.softwareverde.bitcoin.transaction.script.opcode.PushOperation;
-import com.softwareverde.bitcoin.transaction.script.stack.Value;
-import com.softwareverde.bitcoin.transaction.script.unlocking.MutableUnlockingScript;
 import com.softwareverde.bitcoin.util.ByteUtil;
-import com.softwareverde.bitcoin.wallet.PaymentAmount;
-import com.softwareverde.bitcoin.wallet.SlimWallet;
-import com.softwareverde.bitcoin.wallet.SpendableTransactionOutput;
-import com.softwareverde.bitcoin.wallet.Wallet;
-import com.softwareverde.concurrent.ConcurrentHashSet;
-import com.softwareverde.concurrent.Pin;
-import com.softwareverde.concurrent.threadpool.CachedThreadPool;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.bytearray.MutableByteArray;
 import com.softwareverde.constable.list.List;
-import com.softwareverde.constable.list.immutable.ImmutableList;
 import com.softwareverde.constable.list.mutable.MutableList;
-import com.softwareverde.cryptography.hash.sha256.MutableSha256Hash;
 import com.softwareverde.cryptography.hash.sha256.Sha256Hash;
 import com.softwareverde.cryptography.secp256k1.key.PrivateKey;
 import com.softwareverde.http.HttpResponse;
@@ -66,23 +21,11 @@ import com.softwareverde.json.Json;
 import com.softwareverde.logging.LineNumberAnnotatedLog;
 import com.softwareverde.logging.LogLevel;
 import com.softwareverde.logging.Logger;
-import com.softwareverde.network.p2p.node.Node;
-import com.softwareverde.util.Container;
 import com.softwareverde.util.IoUtil;
 import com.softwareverde.util.StringUtil;
 import com.softwareverde.util.Tuple;
-import com.softwareverde.util.Util;
-import com.softwareverde.util.timer.NanoTimer;
-import com.softwareverde.util.type.time.SystemTime;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.math.BigInteger;
-import java.util.ArrayDeque;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Main implements AutoCloseable {
@@ -246,7 +189,7 @@ public class Main implements AutoCloseable {
         }
         else {
             // mine remaining blocks
-            final TestBlockMiner testBlockMiner = new TestBlockMiner(_blockSender, manifestFile, defaultScenarioDirectory, SKIP_MINING);
+            final TestBlockMiner testBlockMiner = new TestBlockMiner(_blockSender, manifestFile, defaultScenarioDirectory, !SKIP_MINING);
             testBlockMiner.mine(blockHeaders, blocksManifestJson, manifestBlockCount, reorgBlocksManifestJson);
         }
     }

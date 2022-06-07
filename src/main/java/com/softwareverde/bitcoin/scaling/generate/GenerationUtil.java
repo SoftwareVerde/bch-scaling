@@ -20,14 +20,9 @@ import com.softwareverde.bitcoin.transaction.TransactionDeflater;
 import com.softwareverde.bitcoin.transaction.coinbase.CoinbaseTransaction;
 import com.softwareverde.bitcoin.transaction.input.TransactionInput;
 import com.softwareverde.bitcoin.transaction.output.TransactionOutput;
-import com.softwareverde.bitcoin.wallet.PaymentAmount;
-import com.softwareverde.bitcoin.wallet.SlimWallet;
-import com.softwareverde.bitcoin.wallet.SpendableTransactionOutput;
-import com.softwareverde.bitcoin.wallet.Wallet;
-import com.softwareverde.bitcoin.wallet.WalletUtxo;
+import com.softwareverde.bitcoin.wallet.*;
 import com.softwareverde.constable.bytearray.ByteArray;
 import com.softwareverde.constable.list.List;
-import com.softwareverde.constable.list.immutable.ImmutableList;
 import com.softwareverde.constable.list.mutable.MutableList;
 import com.softwareverde.cryptography.hash.sha256.Sha256Hash;
 import com.softwareverde.cryptography.secp256k1.key.PrivateKey;
@@ -35,7 +30,6 @@ import com.softwareverde.logging.Logger;
 import com.softwareverde.util.ByteUtil;
 import com.softwareverde.util.IoUtil;
 import com.softwareverde.util.Util;
-import com.softwareverde.util.timer.MultiTimer;
 import com.softwareverde.util.timer.NanoTimer;
 import com.softwareverde.util.type.time.SystemTime;
 
@@ -132,106 +126,6 @@ public class GenerationUtil {
         }
 
         return blockTemplate;
-    }
-
-    public static MutableList<Transaction> createQuasiSteadyStateTransactions(final List<TransactionWithBlockHeight> transactionsToSpend, final Long blockHeight) throws Exception {
-        final Long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
-
-        final AddressInflater addressInflater = new AddressInflater();
-
-        final NanoTimer nanoTimer = new NanoTimer();
-
-        nanoTimer.start();
-        final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
-
-        final TransactionDeflater transactionDeflater = new TransactionDeflater();
-        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT + 8L);
-
-        final int batchSize = 128;
-        final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
-        batchRunner.run(transactionsToSpend, new BatchRunner.Batch<>() {
-            @Override
-            public void run(final List<TransactionWithBlockHeight> batchItems) throws Exception {
-                if (blockSize.get() >= maxBlockSize) { return; }
-
-                final NanoTimer nanoTimer = new NanoTimer();
-                nanoTimer.start();
-
-                long fee = 1500;
-                final long maxFee = 100000L;
-                final long minOutputAmount = 546;
-
-                int outputsToSpendCount = 0;
-                for (final TransactionWithBlockHeight transactionWithBlockHeight : batchItems) {
-                    final Wallet wallet = new Wallet();
-                    wallet.setSatoshisPerByteFee(1D);
-
-                    for (final TransactionOutput transactionOutput : transactionWithBlockHeight.transaction.getTransactionOutputs()) {
-                        final Long amount = transactionOutput.getAmount();
-                        final PrivateKey privateKey = Main.derivePrivateKey(transactionWithBlockHeight.blockHeight, amount);
-                        wallet.addPrivateKey(privateKey);
-
-                        outputsToSpendCount += 1;
-                    }
-                    wallet.addTransaction(transactionWithBlockHeight.transaction);
-
-                    // long fee = wallet.calculateFees(2, outputsToSpendCount);
-
-                    Transaction transaction = null;
-                    while (transaction == null && fee <= maxFee) {
-                        final Long amount = wallet.getBalance();
-                        if (amount < 1L) {
-                            Logger.debug("Zero wallet balance; invalid private key?");
-                        }
-                        final Long amount0 = (amount / 2L);
-                        final Long amount1 = (amount - amount0 - fee);
-
-                        if (amount1 < minOutputAmount) { break; }
-
-                        final Address changeAddress;
-                        final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
-                        {
-                            final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount0);
-                            final Address address = addressInflater.fromPrivateKey(privateKey, true);
-
-                            paymentAmounts.add(new PaymentAmount(address, amount0));
-                        }
-                        {
-                            final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount1);
-                            final Address address = addressInflater.fromPrivateKey(privateKey, true);
-
-                            paymentAmounts.add(new PaymentAmount(address, amount1));
-                            changeAddress = address;
-                        }
-
-                        transaction = wallet.createTransaction(paymentAmounts, changeAddress);
-                        if (transaction == null) {
-                            fee += 500L;
-                            // Logger.debug("Setting Fee: " + fee + "; amount=" + amount + " amount0=" + amount0 + " amount1=" + amount1);
-                        }
-                    }
-                    if (transaction == null) {
-                        Logger.debug("Unable to create transaction.");
-                        break;
-                    }
-
-                    final Integer byteCount = transactionDeflater.getByteCount(transaction);
-                    final long newBlockSize = blockSize.addAndGet(byteCount);
-                    if (newBlockSize >= maxBlockSize) {
-                        Logger.debug("Max block size reached: " + newBlockSize + " of " + maxBlockSize);
-                        return;
-                    }
-
-                    transactions.add(transaction);
-
-                    nanoTimer.stop();
-                }
-            }
-        });
-
-        final MutableList<Transaction> createdTransactions = new MutableList<>(transactions);
-        Logger.debug("Created " + createdTransactions.getCount() + " transactions.");
-        return createdTransactions;
     }
 
     public static class DebugWallet extends Wallet {
@@ -406,84 +300,5 @@ public class GenerationUtil {
         final MutableList<Transaction> createdTransactions = new MutableList<>(transactions);
         Logger.debug("Created " + createdTransactions.getCount() + " transactions.");
         return createdTransactions;
-    }
-
-    public static MutableList<Transaction> createFanInTransactions(final List<TransactionWithBlockHeight> transactionsToSpend, final Long blockHeight) throws Exception {
-        final Long maxBlockSize = 256L * ByteUtil.Unit.Si.MEGABYTES;
-
-        final AddressInflater addressInflater = new AddressInflater();
-
-        final NanoTimer nanoTimer = new NanoTimer();
-
-        nanoTimer.start();
-        final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
-
-        final TransactionDeflater transactionDeflater = new TransactionDeflater();
-        final AtomicLong blockSize = new AtomicLong(BlockHeaderInflater.BLOCK_HEADER_BYTE_COUNT + 8);
-
-        final long minOutputAmount = 546;
-        final int batchSize = 32;
-        final BatchRunner<TransactionWithBlockHeight> batchRunner = new BatchRunner<>(batchSize, true, 4);
-        batchRunner.run(transactionsToSpend, new BatchRunner.Batch<>() {
-            @Override
-            public void run(final List<TransactionWithBlockHeight> batchItems) throws Exception {
-                if (blockSize.get() >= maxBlockSize) { return; }
-
-                final NanoTimer nanoTimer = new NanoTimer();
-                nanoTimer.start();
-
-                final Wallet wallet = new Wallet();
-                wallet.setSatoshisPerByteFee(1D);
-
-                int outputsToSpendCount = 0;
-                for (final TransactionWithBlockHeight transactionWithBlockHeight : batchItems) {
-                    for (final TransactionOutput transactionOutput : transactionWithBlockHeight.transaction.getTransactionOutputs()) {
-                        final Long amount = transactionOutput.getAmount();
-                        final PrivateKey privateKey = Main.derivePrivateKey(transactionWithBlockHeight.blockHeight, amount);
-                        wallet.addPrivateKey(privateKey);
-
-                        outputsToSpendCount += 1;
-                    }
-                    wallet.addTransaction(transactionWithBlockHeight.transaction);
-                }
-
-                final Long totalAmount = wallet.getBalance();
-                if (totalAmount < 1L) {
-                    Logger.debug("Zero wallet balance; invalid private key?");
-                }
-
-                final long maxFee = 100000L;
-                Long fee = wallet.calculateFees(1, outputsToSpendCount);
-                Transaction transaction = null;
-                while (transaction == null && fee <= maxFee) {
-                    final Long amount = (totalAmount - fee);
-                    if (amount < minOutputAmount) { break; }
-
-                    final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, amount);
-                    final Address address = addressInflater.fromPrivateKey(privateKey, true);
-
-                    final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
-                    paymentAmounts.add(new PaymentAmount(address, amount));
-
-                    transaction = wallet.createTransaction(paymentAmounts, address);
-                    fee += 500L;
-                }
-                if (transaction == null) {
-                    Logger.debug("Unable to create transaction.");
-                    return;
-                }
-
-                final Integer byteCount = transactionDeflater.getByteCount(transaction);
-                final long newBlockSize = blockSize.addAndGet(byteCount);
-                if (newBlockSize >= maxBlockSize) { return; }
-
-                transactions.add(transaction);
-
-                nanoTimer.stop();
-                // Logger.debug("Spent " + batchItems.getCount() + " transactions in " + nanoTimer.getMillisecondsElapsed() + "ms.");
-            }
-        });
-
-        return new MutableList<>(transactions);
     }
 }
