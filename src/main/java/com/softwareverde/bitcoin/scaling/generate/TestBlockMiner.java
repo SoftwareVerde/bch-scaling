@@ -63,10 +63,7 @@ public class TestBlockMiner {
         // final long firstScenarioBlockHeight = blockHeaders.getCount();
         {
             final int targetNewBlockCount = coinbaseMaturityBlockCount;
-            final List<BlockHeader> scenarioBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, null);
-            blockHeaders.addAll(scenarioBlocks);
-            _updateManifest(newManifestJson, scenarioBlocks);
-            runningBlockHeight += scenarioBlocks.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, null, newManifestJson);
         }
 
         Logger.info("Generating fan-out blocks: " + runningBlockHeight);
@@ -74,10 +71,7 @@ public class TestBlockMiner {
         {
             final int targetNewBlockCount = 10;
             final TransactionGenerator transactionGenerator = new FanOutBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount);
-            final List<BlockHeader> fanOutBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
-            blockHeaders.addAll(fanOutBlocks);
-            _updateManifest(newManifestJson, fanOutBlocks);
-            runningBlockHeight += fanOutBlocks.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator, newManifestJson);
         }
 
         Logger.info("Generating quasi-steady-state blocks: " + runningBlockHeight);
@@ -85,10 +79,7 @@ public class TestBlockMiner {
         {
             final int targetNewBlockCount = 5;
             final TransactionGenerator transactionGenerator = new QuasiSteadyStateRound1BlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, firstQuasiSteadyStateBlockHeight, firstFanOutBlockHeight);
-            final List<BlockHeader> quasiSteadyStateBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
-            blockHeaders.addAll(quasiSteadyStateBlocks);
-            _updateManifest(newManifestJson, quasiSteadyStateBlocks);
-            runningBlockHeight += quasiSteadyStateBlocks.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator, newManifestJson);
         }
 
         Logger.info("Generating fan-in blocks: " + runningBlockHeight);
@@ -97,10 +88,7 @@ public class TestBlockMiner {
             final int targetNewBlockCount = 2;
             final long startingBlockHeightToSpend = (firstQuasiSteadyStateBlockHeight - firstFanInBlockHeight); // spend the quasi-steady-state blocks txns in-order...
             final TransactionGenerator transactionGenerator = new FanInBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, startingBlockHeightToSpend);
-            final MutableList<BlockHeader> fanInBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
-            blockHeaders.addAll(fanInBlocks);
-            _updateManifest(newManifestJson, fanInBlocks);
-            runningBlockHeight += fanInBlocks.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator, newManifestJson);
         }
 
         Logger.info("Generating 2nd quasi-steady-state blocks: " + runningBlockHeight);
@@ -108,10 +96,7 @@ public class TestBlockMiner {
         {
             final int targetNewBlockCount = 5;
             final TransactionGenerator transactionGenerator = new QuasiSteadyStateRound2BlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, firstQuasiSteadyStateBlockHeightRoundTwo, firstFanInBlockHeight, firstFanOutBlockHeight);
-            final MutableList<BlockHeader> quasiSteadyStateBlocksRoundTwo = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
-            blockHeaders.addAll(quasiSteadyStateBlocksRoundTwo);
-            _updateManifest(newManifestJson, quasiSteadyStateBlocksRoundTwo);
-            runningBlockHeight += quasiSteadyStateBlocksRoundTwo.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator, newManifestJson);
         }
 
         Logger.info("Generating steady-state blocks: " + runningBlockHeight);
@@ -183,10 +168,7 @@ public class TestBlockMiner {
 
             final int targetNewBlockCount = 10;
             final TransactionGenerator transactionGenerator = new SteadyStateBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, availableUtxos, firstSteadyStateBlockHeight);
-            final MutableList<BlockHeader> steadyStateBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
-            blockHeaders.addAll(steadyStateBlocks);
-            _updateManifest(newManifestJson, steadyStateBlocks);
-            runningBlockHeight += steadyStateBlocks.getCount();
+            runningBlockHeight += _mineBlocks(blockGenerator, blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator, newManifestJson);
         }
 
         final Json json = new Json();
@@ -197,7 +179,14 @@ public class TestBlockMiner {
         IoUtil.putFileContents(_manifestFile, StringUtil.stringToBytes(json.toString()));
     }
 
-    private void _updateManifest(Json newManifestJson, List<BlockHeader> newBlockHeaders) {
+    protected int _mineBlocks(BlockGenerator blockGenerator, Json blocksManifestJson, long runningBlockHeight, int targetNewBlockCount, MutableList<BlockHeader> blockHeaders, TransactionGenerator transactionGenerator, Json newManifestJson) {
+        final List<BlockHeader> scenarioBlocks = blockGenerator.generateBlocks(blocksManifestJson, runningBlockHeight, targetNewBlockCount, blockHeaders, transactionGenerator);
+        blockHeaders.addAll(scenarioBlocks);
+        _updateManifest(newManifestJson, scenarioBlocks);
+        return scenarioBlocks.getCount();
+    }
+
+    protected void _updateManifest(Json newManifestJson, List<BlockHeader> newBlockHeaders) {
         for (final BlockHeader blockHeader : newBlockHeaders) {
             final Sha256Hash blockHash = blockHeader.getHash();
             newManifestJson.add(blockHash);
