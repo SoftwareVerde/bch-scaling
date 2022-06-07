@@ -1,4 +1,4 @@
-package com.softwareverde.bitcoin.scaling;
+package com.softwareverde.bitcoin.scaling.generate;
 
 import com.softwareverde.bitcoin.transaction.Transaction;
 

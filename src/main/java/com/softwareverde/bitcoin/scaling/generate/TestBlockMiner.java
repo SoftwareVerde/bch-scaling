@@ -115,56 +115,8 @@ public class TestBlockMiner {
             final MutableList<BlockHeader> fanOutBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, _scenarioDirectory);
             _blockSender.sendBlocks(fanOutBlocks, runningBlockHeight, _scenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - fanOutBlocks.getCount());
-            fanOutBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, new TransactionGenerator() {
-                @Override
-                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final long coinbaseToSpendBlockHeight = (blockHeight - coinbaseMaturityBlockCount); // preFanOutBlock...
-                    final BlockHeader blockHeader = blockHeaders.get((int) coinbaseToSpendBlockHeight);
-                    final Block block = DiskUtil.loadBlock(blockHeader.getHash(), _scenarioDirectory);
-
-                    final Transaction transactionToSplit = block.getCoinbaseTransaction();
-                    final PrivateKey coinbasePrivateKey = privateKeyGenerator.getCoinbasePrivateKey(coinbaseToSpendBlockHeight);
-
-                    // Spend the coinbase
-                    final Transaction transaction;
-                    final PrivateKey transactionPrivateKey;
-                    {
-                        final Wallet wallet = new Wallet();
-                        wallet.addPrivateKey(coinbasePrivateKey);
-                        wallet.addTransaction(transactionToSplit);
-
-                        final Address address = wallet.getReceivingAddress();
-                        final Long totalOutputValue = transactionToSplit.getTotalOutputValue();
-
-                        final int outputCount = 4;
-                        final Long outputValue = (totalOutputValue / outputCount) - 250L;
-                        final MutableList<PaymentAmount> paymentAmounts = new MutableList<>(outputCount);
-                        for (int i = 0; i < outputCount; ++i) {
-                            paymentAmounts.add(new PaymentAmount(address, outputValue));
-                        }
-
-                        transaction = wallet.createTransaction(paymentAmounts, address);
-                        if (transaction == null) {
-                            Logger.warn("Unable to create transaction.");
-                        }
-
-                        transactionPrivateKey = coinbasePrivateKey;
-                    }
-
-                    try {
-                        final MutableList<Transaction> transactions = GenerationUtil.createFanOutTransactions(transaction, transactionPrivateKey, blockHeight);
-
-                        _writeTransactionGenerationOrder(transaction, transactions, _scenarioDirectory, blockHeight);
-
-                        transactions.add(transaction);
-                        return transactions;
-                    }
-                    catch (final Exception exception) {
-                        Logger.warn(exception);
-                        return null;
-                    }
-                }
-            }, _calculateTimestamp(blockHeaders)));
+            final TransactionGenerator transactionGenerator = new FanOutBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount);
+            fanOutBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, transactionGenerator, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(fanOutBlocks);
             for (final BlockHeader blockHeader : fanOutBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -180,54 +132,8 @@ public class TestBlockMiner {
             final MutableList<BlockHeader> quasiSteadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, _scenarioDirectory);
             _blockSender.sendBlocks(quasiSteadyStateBlocks, runningBlockHeight, _scenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocks.getCount());
-            quasiSteadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, new TransactionGenerator() {
-                @Override
-                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
-                    {
-                        final StringBuilder stringBuilder = new StringBuilder("blockHeight=" + blockHeight);
-                        // Spending only first half of each 10 fan-out blocks, over 5 quasi-steady-state blocks, means each quasi-steady state block spends 1/5 of 1/2 of each fan-out block.
-                        final int quasiSteadyStateBlockIndex = (int) (blockHeight - firstQuasiSteadyStateBlockHeight);
-                        stringBuilder.append(" quasiSteadyStateBlockIndex=" + quasiSteadyStateBlockIndex);
-                        for (int i = 0; i < 10; ++i) {
-                            stringBuilder.append(" (");
-                            final long blockHeightToSpend = (firstFanOutBlockHeight + i); // (firstFanOutBlockHeight + steadyStateBlockIndex + i)
-                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
-                            final Block blockToSpend = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
-                            stringBuilder.append("blockHeightToSpend=" + blockHeightToSpend + " blockHash=" + blockHash);
-
-                            final int transactionCount = blockToSpend.getTransactionCount();
-                            stringBuilder.append(" transactionCount=" + transactionCount);
-                            final int transactionCountToSpend = ((transactionCount / 2) / 5); // (transactionCount / 5)
-                            stringBuilder.append(" transactionCountToSpend=" + transactionCountToSpend);
-                            final List<Transaction> transactions = blockToSpend.getTransactions();
-                            stringBuilder.append(" transactions.count=" + transactions.getCount());
-                            final int startIndex = (1 + (transactionCountToSpend * quasiSteadyStateBlockIndex));
-                            stringBuilder.append(" startIndex=" + startIndex);
-                            final int endIndex = (transactionCountToSpend + startIndex);
-                            for (int j = startIndex; j < endIndex; ++j) {
-                                if (j >= transactionCount) { break; }
-
-                                final Transaction transaction = transactions.get(j);
-                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
-                            }
-                            stringBuilder.append(")");
-                        }
-                        // Logger.debug(stringBuilder);
-                    }
-                    // Logger.debug("transactionsToSpend.count=" + transactionsToSpend.getCount());
-
-                    try {
-                        final List<Transaction> transactions = GenerationUtil.createQuasiSteadyStateTransactions(transactionsToSpend, blockHeight);
-                        _writeTransactionGenerationOrder(null, transactions, _scenarioDirectory, blockHeight);
-                        return transactions;
-                    }
-                    catch (final Exception exception) {
-                        Logger.warn(exception);
-                        return null;
-                    }
-                }
-            }, _calculateTimestamp(blockHeaders)));
+            final TransactionGenerator transactionGenerator = new QuasiSteadyStateRound1BlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, firstQuasiSteadyStateBlockHeight, firstFanOutBlockHeight);
+            quasiSteadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, transactionGenerator, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(quasiSteadyStateBlocks);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -243,35 +149,9 @@ public class TestBlockMiner {
             final MutableList<BlockHeader> fanInBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, _scenarioDirectory);
             _blockSender.sendBlocks(fanInBlocks, runningBlockHeight, _scenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - fanInBlocks.getCount());
-            fanInBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, new TransactionGenerator() {
-                @Override
-                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final MutableList<TransactionWithBlockHeight> transactionsToSpend;
-                    {
-                        final long blockHeightToSpend = (firstQuasiSteadyStateBlockHeight + (blockHeight - firstFanInBlockHeight)); // spend the quasi-steady-state blocks txns in-order...
-                        final Sha256Hash blockHash = blockHeaders.get((int) blockHeightToSpend).getHash();
-                        final Block blockToSpend = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
-                        final int transactionCount = blockToSpend.getTransactionCount();
-                        transactionsToSpend = new MutableList<>(transactionCount - 1);
-
-                        final List<Transaction> transactions = blockToSpend.getTransactions();
-                        for (int i = 1; i < transactionCount; ++i) {
-                            final Transaction transaction = transactions.get(i);
-                            transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
-                        }
-                    }
-
-                    try {
-                        final List<Transaction> transactions = GenerationUtil.createFanInTransactions(transactionsToSpend, blockHeight);
-                        _writeTransactionGenerationOrder(null, transactions, _scenarioDirectory, blockHeight);
-                        return transactions;
-                    }
-                    catch (final Exception exception) {
-                        Logger.warn(exception);
-                        return null;
-                    }
-                }
-            }, _calculateTimestamp(blockHeaders)));
+            final long startingBlockHeightToSpend = (firstQuasiSteadyStateBlockHeight - firstFanInBlockHeight); // spend the quasi-steady-state blocks txns in-order...
+            final TransactionGenerator transactionGenerator = new FanInBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, startingBlockHeightToSpend);
+            fanInBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, transactionGenerator, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(fanInBlocks);
             for (final BlockHeader blockHeader : fanInBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -289,55 +169,8 @@ public class TestBlockMiner {
             Logger.debug("Loaded " + quasiSteadyStateBlocksRoundTwo.getCount() + " from manifest...");
             _blockSender.sendBlocks(quasiSteadyStateBlocksRoundTwo, runningBlockHeight, _scenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocksRoundTwo.getCount());
-            quasiSteadyStateBlocksRoundTwo.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, new TransactionGenerator() {
-                @Override
-                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final MutableList<TransactionWithBlockHeight> transactionsToSpend = new MutableList<>();
-                    {
-                        final int steadyStateBlockIndex = (int) (blockHeight - firstQuasiSteadyStateBlockHeightRoundTwo); // the Nth of 5 steady state blocks...
-
-                        // Spend the respective fan-in block...
-                        {
-                            final long blockHeightToSpend = (firstFanInBlockHeight + steadyStateBlockIndex);
-                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
-                            final Block blockToSpend = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
-                            final List<Transaction> transactions = blockToSpend.getTransactions();
-                            for (int i = 1; i < transactions.getCount(); ++i) {
-                                final Transaction transaction = transactions.get(i);
-                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
-                            }
-                        }
-
-                        // And spend only the second half of each 10 fan-out blocks, over 5 steady-state blocks, means each steady state block spends 1/5 of 1/2 of each fan-out block.
-                        for (int i = 0; i < 10; ++i) {
-                            final long blockHeightToSpend = (firstFanOutBlockHeight + steadyStateBlockIndex + i);
-                            final Sha256Hash blockHash = Main.getBlockHash(blockHeightToSpend, blockHeaders, createdBlocks);
-                            final Block blockToSpend = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
-
-                            final int transactionCount = blockToSpend.getTransactionCount();
-                            final int transactionCountToSpend = (transactionCount / 5);
-                            final List<Transaction> transactions = blockToSpend.getTransactions();
-                            final int startIndex = (1 + (transactionCountToSpend * steadyStateBlockIndex)) + (transactionCount / 2);
-                            for (int j = startIndex; j < transactionCountToSpend; ++j) {
-                                if (j >= transactionCount) { break; }
-
-                                final Transaction transaction = transactions.get(j);
-                                transactionsToSpend.add(new TransactionWithBlockHeight(transaction, blockHeightToSpend));
-                            }
-                        }
-                    }
-
-                    try {
-                        final List<Transaction> transactions = GenerationUtil.createQuasiSteadyStateTransactions(transactionsToSpend, blockHeight);
-                        _writeTransactionGenerationOrder(null, transactions, _scenarioDirectory, blockHeight);
-                        return transactions;
-                    }
-                    catch (final Exception exception) {
-                        Logger.warn(exception);
-                        return null;
-                    }
-                }
-            }, _calculateTimestamp(blockHeaders)));
+            final TransactionGenerator transactionGenerator = new QuasiSteadyStateRound2BlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, firstQuasiSteadyStateBlockHeightRoundTwo, firstFanInBlockHeight, firstFanOutBlockHeight);
+            quasiSteadyStateBlocksRoundTwo.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, transactionGenerator, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(quasiSteadyStateBlocksRoundTwo);
             for (final BlockHeader blockHeader : quasiSteadyStateBlocksRoundTwo) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -411,63 +244,14 @@ public class TestBlockMiner {
             Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
             // Arbitrarily order/mix the UTXOs...
-            final Comparator<SpendableTransactionOutput> testUtxoComparator = new Comparator<SpendableTransactionOutput>() {
-                @Override
-                public int compare(final SpendableTransactionOutput utxo0, final SpendableTransactionOutput utxo1) {
-                    final Sha256Hash transactionHash0 = utxo0.getTransactionHash();
-                    final long value0 = ByteUtil.byteToLong(transactionHash0.getByte(Sha256Hash.BYTE_COUNT - 1)) + (utxo0.getIndex() * utxo0.getAmount());
-
-                    final Sha256Hash transactionHash1 = utxo1.getTransactionHash();
-                    final long value1 = ByteUtil.byteToLong(transactionHash1.getByte(Sha256Hash.BYTE_COUNT - 1)) + (utxo1.getIndex() * utxo1.getAmount());
-
-                    return Long.compare(value0, value1);
-                }
-            };
-            availableUtxos.sort(testUtxoComparator);
+            availableUtxos.sort(SteadyStateBlockTransactionGenerator.testUtxoComparator);
 
             final int targetNewBlockCount = 10;
             final MutableList<BlockHeader> steadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, _scenarioDirectory);
             _blockSender.sendBlocks(steadyStateBlocks, runningBlockHeight, _scenarioDirectory, false);
             final int newBlockCount = (targetNewBlockCount - steadyStateBlocks.getCount());
-            steadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, new TransactionGenerator() {
-                @Override
-                public List<Transaction> getTransactions(final Long blockHeight, final List<BlockHeader> createdBlocks) {
-                    final int blockOffset = (int) (blockHeight - firstSteadyStateBlockHeight);
-                    final long spendBlockHeight = (156L + blockOffset);
-                    Logger.debug("Spending Block #" + spendBlockHeight + "'s coinbase.");
-                    final Transaction additionalTransactionFromPreviousCoinbase = _splitCoinbaseTransaction(blockHeight, spendBlockHeight, blockHeaders, _scenarioDirectory, privateKeyGenerator);
-                    { // Add the coinbase UTXOs to the pool.
-                        availableUtxos.addAll(SlimWallet.getTransactionOutputs(additionalTransactionFromPreviousCoinbase, blockHeight, false));
-
-                        // Arbitrarily re-order/mix the UTXOs...
-                        availableUtxos.sort(testUtxoComparator);
-                    }
-
-                    Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
-
-                    try {
-                        final ArrayDeque<SpendableTransactionOutput> utxoDeque = new ArrayDeque<>();
-                        for (final SpendableTransactionOutput utxo : availableUtxos) {
-                            utxoDeque.add(utxo);
-                        }
-                        final List<Transaction> generatedTransactions = GenerationUtil.createCashTransactions(additionalTransactionFromPreviousCoinbase, utxoDeque, blockHeight);
-
-                        availableUtxos.clear();
-                        availableUtxos.addAll(utxoDeque);
-
-                        _writeTransactionGenerationOrder(additionalTransactionFromPreviousCoinbase, generatedTransactions, _scenarioDirectory, blockHeight);
-
-                        final MutableList<Transaction> transactions = new MutableList<>(generatedTransactions.getCount() + 1);
-                        transactions.add(additionalTransactionFromPreviousCoinbase);
-                        transactions.addAll(generatedTransactions);
-                        return transactions;
-                    }
-                    catch (final Exception exception) {
-                        Logger.warn(exception);
-                        return null;
-                    }
-                }
-            }, _calculateTimestamp(blockHeaders)));
+            final TransactionGenerator transactionGenerator = new SteadyStateBlockTransactionGenerator(privateKeyGenerator, _scenarioDirectory, coinbaseMaturityBlockCount, availableUtxos, firstSteadyStateBlockHeight);
+            steadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, _scenarioDirectory, blockHeaders, transactionGenerator, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(steadyStateBlocks);
             for (final BlockHeader blockHeader : steadyStateBlocks) {
                 final Sha256Hash blockHash = blockHeader.getHash();
@@ -522,71 +306,6 @@ public class TestBlockMiner {
 
         final long tenMinutes = 10L * 60L;
         return (timestamp + tenMinutes);
-    }
-
-    protected void _writeTransactionGenerationOrder(final Transaction transaction, final List<Transaction> transactions, final File _scenarioDirectory, final Long blockHeight) {
-        final File directory = new File(_scenarioDirectory, "mempool");
-        if (! directory.exists()) {
-            directory.mkdirs();
-        }
-
-        final File file = new File(directory, blockHeight + ".sha");
-        try (final FileOutputStream fileOutputStream = new FileOutputStream(file, false)) {
-            if (transaction != null) {
-                final Sha256Hash transactionHash = transaction.getHash();
-                fileOutputStream.write(transactionHash.getBytes());
-            }
-            for (final Transaction tx : transactions) {
-                final Sha256Hash transactionHash = tx.getHash();
-                fileOutputStream.write(transactionHash.getBytes());
-            }
-        }
-        catch (final Exception exception) {
-            Logger.debug(exception);
-        }
-    }
-
-    protected Transaction _splitCoinbaseTransaction(final Long blockHeight, final Long coinbaseToSpendBlockHeight, final List<BlockHeader> blockHeaders, final File _scenarioDirectory, final PrivateKeyGenerator privateKeyGenerator) {
-        final BlockHeader blockHeader = blockHeaders.get(coinbaseToSpendBlockHeight.intValue());
-        Logger.debug("Splitting Coinbase: " + blockHeader.getHash());
-        final Block block = DiskUtil.loadBlock(blockHeader.getHash(), _scenarioDirectory);
-
-        final Transaction transactionToSplit = block.getCoinbaseTransaction();
-        final PrivateKey coinbasePrivateKey = privateKeyGenerator.getCoinbasePrivateKey(coinbaseToSpendBlockHeight);
-
-        final Wallet wallet = new Wallet();
-        wallet.addPrivateKey(coinbasePrivateKey);
-        wallet.addTransaction(transactionToSplit);
-
-        final Address changeAddress = wallet.getReceivingAddress();
-        final Long totalOutputValue = transactionToSplit.getTotalOutputValue();
-
-        final int outputCount = 200;
-        final Long outputValue = (totalOutputValue / outputCount) - 15000L;
-
-        final Address address;
-        {
-            final PrivateKey privateKey = Main.derivePrivateKey(blockHeight, outputValue);
-            final AddressInflater addressInflater = new AddressInflater();
-            address = addressInflater.fromPrivateKey(privateKey, true);
-        }
-
-        final MutableList<PaymentAmount> paymentAmounts = new MutableList<>(outputCount);
-        for (int i = 0; i < outputCount; ++i) {
-            paymentAmounts.add(new PaymentAmount(address, outputValue));
-        }
-
-        final Transaction transaction = wallet.createTransaction(paymentAmounts, changeAddress);
-        if (transaction == null) {
-            Logger.warn("Unable to create transaction.");
-
-            { // Debug.
-                Logger.setLogLevel("com.softwareverde.bitcoin.wallet.Wallet", LogLevel.ON);
-                wallet.createTransaction(paymentAmounts, changeAddress);
-            }
-        }
-
-        return transaction;
     }
 
     protected MutableList<BlockHeader> _generateBlocks(final PrivateKeyGenerator privateKeyGenerator, final Integer blockCount, final File blocksDirectory, final List<BlockHeader> initBlocks, final Long timestamp) {
@@ -685,7 +404,7 @@ public class TestBlockMiner {
 
             final Long nextBlockHeight = (long) blocksCount;
             // final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
-            blockTemplateContainer.value = GenerationUtil.getBlockTemplate(blocksDirectory, previousBlockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, createdBlocks); // _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+            blockTemplateContainer.value = GenerationUtil.getBlockTemplate(blocksDirectory, previousBlockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, initBlocks, createdBlocks); // _createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
 
             nanoTimer.stop();
             Logger.debug("Template generated in: " + nanoTimer.getMillisecondsElapsed() + "ms.");
@@ -737,7 +456,7 @@ public class TestBlockMiner {
 
                 final long nextBlockHeight = (blockHeight + 1L);
                 // final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight) : new MutableList<>(0));
-                blockTemplateContainer.value = GenerationUtil.getBlockTemplate(blocksDirectory, blockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, createdBlocks); // _createBlockTemplate(blockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
+                blockTemplateContainer.value = GenerationUtil.getBlockTemplate(blocksDirectory, blockHash, nextBlockHeight, transactionGenerator, difficultyCalculatorContext, initBlocks, createdBlocks); // _createBlockTemplate(blockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
                 synchronized (blockTemplateContainer) {
                     blockTemplateContainer.notifyAll();
                 }

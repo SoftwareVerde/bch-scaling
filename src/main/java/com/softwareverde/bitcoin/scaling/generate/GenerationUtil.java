@@ -14,8 +14,6 @@ import com.softwareverde.bitcoin.rpc.BlockTemplate;
 import com.softwareverde.bitcoin.rpc.MutableBlockTemplate;
 import com.softwareverde.bitcoin.scaling.Main;
 import com.softwareverde.bitcoin.scaling.PrivateTestNetDifficultyCalculatorContext;
-import com.softwareverde.bitcoin.scaling.TransactionGenerator;
-import com.softwareverde.bitcoin.scaling.TransactionWithBlockHeight;
 import com.softwareverde.bitcoin.server.database.BatchRunner;
 import com.softwareverde.bitcoin.transaction.Transaction;
 import com.softwareverde.bitcoin.transaction.TransactionDeflater;
@@ -49,7 +47,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class GenerationUtil {
     protected GenerationUtil() { }
 
-    public static BlockTemplate getBlockTemplate(final File blocksDirectory, final Sha256Hash previousBlockHash, final Long nextBlockHeight, final TransactionGenerator transactionGenerator, final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext, final List<BlockHeader> createdBlocks) {
+    public static BlockTemplate getBlockTemplate(final File blocksDirectory, final Sha256Hash previousBlockHash, final Long nextBlockHeight, final TransactionGenerator transactionGenerator, final PrivateTestNetDifficultyCalculatorContext difficultyCalculatorContext, final List<BlockHeader> existingBlockHeaders, final List<BlockHeader> createdBlocks) {
         final File templatesDirectory = new File(blocksDirectory, "templates");
         if (! templatesDirectory.exists()) {
             templatesDirectory.mkdirs();
@@ -92,7 +90,7 @@ public class GenerationUtil {
             return blockTemplate;
         }
 
-        final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight, createdBlocks) : new MutableList<>(0));
+        final List<Transaction> transactions = ((transactionGenerator != null) ? transactionGenerator.getTransactions(nextBlockHeight, existingBlockHeaders, createdBlocks) : new MutableList<>(0));
         final BlockTemplate blockTemplate = GenerationUtil.createBlockTemplate(previousBlockHash, nextBlockHeight, transactions, difficultyCalculatorContext);
 
         try {
@@ -134,88 +132,6 @@ public class GenerationUtil {
         }
 
         return blockTemplate;
-    }
-
-    public static MutableList<Transaction> createFanOutTransactions(final Transaction rootTransactionToSpend, final PrivateKey privateKey, final Long blockHeight) throws Exception {
-        final int transactionCount = 256000;
-        final int outputsPerTransactionCount = 25; // TxSize = 158 + (34 * OutputCount) ~= 1024
-        final long minOutputAmount = 546;
-
-        final AddressInflater addressInflater = new AddressInflater();
-
-        final NanoTimer nanoTimer = new NanoTimer();
-
-        nanoTimer.start();
-        final ConcurrentLinkedQueue<Transaction> transactions = new ConcurrentLinkedQueue<>();
-
-        final BatchRunner<Integer> batchRunner = new BatchRunner<>(1, true);
-        batchRunner.run(new ImmutableList<>(0, 1, 2, 3), new BatchRunner.Batch<Integer>() {
-            @Override
-            public void run(final List<Integer> batchItems) throws Exception {
-                Transaction transactionToSpend = rootTransactionToSpend;
-                final MutableList<Integer> possibleOutputsList = new MutableList<>();
-                {
-                    final Integer index = batchItems.get(0);
-                    possibleOutputsList.add(index);
-                }
-
-                final MultiTimer multiTimer = new MultiTimer();
-                multiTimer.start();
-
-                final int batchTransactionCount = (transactionCount / 4);
-                for (int i = 0; i < batchTransactionCount; ++i) {
-                    multiTimer.mark("batchStart");
-                    final MutableList<PaymentAmount> paymentAmounts = new MutableList<>();
-                    for (int j = 0; j < outputsPerTransactionCount; ++j) {
-                        final Long amount = minOutputAmount + ((long) (Math.random() * 4268L / 4));
-                        final PrivateKey recipientPrivateKey = Main.derivePrivateKey(blockHeight, amount);
-                        final Address recipientAddress = addressInflater.fromPrivateKey(recipientPrivateKey, true);
-
-                        paymentAmounts.add(new PaymentAmount(recipientAddress, amount));
-                    }
-                    multiTimer.mark("paymentAmounts");
-
-                    final Wallet wallet = new Wallet();
-                    wallet.setSatoshisPerByteFee(1D);
-
-                    wallet.addPrivateKey(privateKey);
-                    if (possibleOutputsList.isEmpty()) {
-                        wallet.addTransaction(transactionToSpend);
-                    }
-                    else {
-                        wallet.addTransaction(transactionToSpend, possibleOutputsList);
-                    }
-
-                    multiTimer.mark("walletInit");
-
-                    final Transaction transaction = wallet.createTransaction(paymentAmounts, wallet.getReceivingAddress());
-                    if (transaction == null) {
-                        Logger.debug("Unable to create transaction. (Insufficient funds?)");
-                        break;
-                    }
-
-                    multiTimer.mark("createTransaction");
-
-                    transactions.add(transaction);
-                    multiTimer.mark("addTransaction");
-
-                    nanoTimer.stop();
-
-                    if (i % 1024 == 0) {
-                        final double msElapsed = nanoTimer.getMillisecondsElapsed();
-                        final int txPerSec = (int) (i * 1000L / msElapsed);
-                        Logger.debug(i + " of " + batchTransactionCount + " transactions. (" + txPerSec + " tx/sec) " + multiTimer);
-                    }
-
-                    transactionToSpend = transaction;
-                    if (i == 0) {
-                        possibleOutputsList.clear();
-                    }
-                }
-            }
-        });
-
-        return new MutableList<>(transactions);
     }
 
     public static MutableList<Transaction> createQuasiSteadyStateTransactions(final List<TransactionWithBlockHeight> transactionsToSpend, final Long blockHeight) throws Exception {
