@@ -102,65 +102,9 @@ public class TestBlockMiner {
         Logger.info("Generating steady-state blocks: " + runningBlockHeight);
         // Spends all UTXOs from block# 145, excluding coinbases.
         // Spends coinbases from 156-160 (inclusive).
-        int unspentOutputCount = 0;
         final Long firstSteadyStateBlockHeight = (long) blockHeaders.getCount();
         {
-            final HashMap<Sha256Hash, MutableList<SpendableTransactionOutput>> utxoMap = new HashMap<>();
-            {
-                long blockHeight = firstSpendableCoinbaseBlockHeight;
-                while (blockHeight < blockHeaders.getCount()) {
-                    // Logger.debug("Loading Block Height: " + blockHeight);
-                    final BlockHeader blockHeader = blockHeaders.get((int) blockHeight);
-                    final Sha256Hash blockHash = blockHeader.getHash();
-                    final Block block = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
-                    // Logger.debug("Block Hash: " + blockHeader.getHash() + " " + (block != null ? "block" : null));
-
-                    boolean isCoinbase = true;
-                    for (final Transaction transaction : block.getTransactions()) {
-                        if (isCoinbase) {
-                            // final boolean isSpendableCoinbase = ((firstSpendableCoinbaseBlockHeight - blockHeight) >= 100L);
-                            isCoinbase = false;
-
-                            // if (! isSpendableCoinbase) { continue; }
-                            continue;
-                        }
-
-                        final MutableList<SpendableTransactionOutput> spendableTransactionOutputs = SlimWallet.getTransactionOutputs(transaction, blockHeight, isCoinbase);
-                        final Sha256Hash transactionHash = transaction.getHash();
-                        utxoMap.put(transactionHash, spendableTransactionOutputs);
-                        unspentOutputCount += spendableTransactionOutputs.getCount();
-                    }
-
-                    isCoinbase = true;
-                    for (final Transaction transaction : block.getTransactions()) {
-                        if (isCoinbase) {
-                            isCoinbase = false;
-                            continue;
-                        }
-
-                        for (final TransactionInput transactionInput : transaction.getTransactionInputs()) {
-                            final Sha256Hash prevoutHash = transactionInput.getPreviousOutputTransactionHash();
-                            if (! utxoMap.containsKey(prevoutHash)) { continue; }
-
-                            final Integer prevoutIndex = transactionInput.getPreviousOutputIndex();
-                            final MutableList<SpendableTransactionOutput> utxoSet = utxoMap.get(prevoutHash);
-                            utxoSet.set(prevoutIndex, null);
-                            unspentOutputCount -= 1;
-                        }
-                    }
-
-                    blockHeight += 1L;
-                }
-            }
-
-            final MutableList<SpendableTransactionOutput> availableUtxos = new MutableList<>(unspentOutputCount);
-            for (final MutableList<SpendableTransactionOutput> list : utxoMap.values()) {
-                for (final SpendableTransactionOutput spendableTransactionOutput : list) {
-                    if (spendableTransactionOutput != null) {
-                        availableUtxos.add(spendableTransactionOutput);
-                    }
-                }
-            }
+            final MutableList<SpendableTransactionOutput> availableUtxos = _getAvailableUtxos(blockHeaders, firstSpendableCoinbaseBlockHeight);
             Logger.debug("availableUtxos.count=" + availableUtxos.getCount());
 
             // Arbitrarily order/mix the UTXOs...
@@ -191,5 +135,66 @@ public class TestBlockMiner {
             final Sha256Hash blockHash = blockHeader.getHash();
             newManifestJson.add(blockHash);
         }
+    }
+
+    protected MutableList<SpendableTransactionOutput> _getAvailableUtxos(final MutableList<BlockHeader> blockHeaders, final long startingBlockHeight) {
+        final HashMap<Sha256Hash, MutableList<SpendableTransactionOutput>> utxoMap = new HashMap<>();
+        int unspentOutputCount = 0;
+        {
+            long blockHeight = startingBlockHeight;
+            while (blockHeight < blockHeaders.getCount()) {
+                // Logger.debug("Loading Block Height: " + blockHeight);
+                final BlockHeader blockHeader = blockHeaders.get((int) blockHeight);
+                final Sha256Hash blockHash = blockHeader.getHash();
+                final Block block = DiskUtil.loadBlock(blockHash, _scenarioDirectory);
+                // Logger.debug("Block Hash: " + blockHeader.getHash() + " " + (block != null ? "block" : null));
+
+                boolean isCoinbase = true;
+                for (final Transaction transaction : block.getTransactions()) {
+                    if (isCoinbase) {
+                        // final boolean isSpendableCoinbase = ((firstSpendableCoinbaseBlockHeight - blockHeight) >= 100L);
+                        isCoinbase = false;
+
+                        // if (! isSpendableCoinbase) { continue; }
+                        continue;
+                    }
+
+                    final MutableList<SpendableTransactionOutput> spendableTransactionOutputs = SlimWallet.getTransactionOutputs(transaction, blockHeight, isCoinbase);
+                    final Sha256Hash transactionHash = transaction.getHash();
+                    utxoMap.put(transactionHash, spendableTransactionOutputs);
+                    unspentOutputCount += spendableTransactionOutputs.getCount();
+                }
+
+                isCoinbase = true;
+                for (final Transaction transaction : block.getTransactions()) {
+                    if (isCoinbase) {
+                        isCoinbase = false;
+                        continue;
+                    }
+
+                    for (final TransactionInput transactionInput : transaction.getTransactionInputs()) {
+                        final Sha256Hash prevoutHash = transactionInput.getPreviousOutputTransactionHash();
+                        if (! utxoMap.containsKey(prevoutHash)) { continue; }
+
+                        final Integer prevoutIndex = transactionInput.getPreviousOutputIndex();
+                        final MutableList<SpendableTransactionOutput> utxoSet = utxoMap.get(prevoutHash);
+                        utxoSet.set(prevoutIndex, null);
+                        unspentOutputCount -= 1;
+                    }
+                }
+
+                blockHeight += 1L;
+            }
+        }
+
+        final MutableList<SpendableTransactionOutput> availableUtxos = new MutableList<>(unspentOutputCount);
+        for (final MutableList<SpendableTransactionOutput> list : utxoMap.values()) {
+            for (final SpendableTransactionOutput spendableTransactionOutput : list) {
+                if (spendableTransactionOutput != null) {
+                    availableUtxos.add(spendableTransactionOutput);
+                }
+            }
+        }
+        return availableUtxos;
     }
 }
