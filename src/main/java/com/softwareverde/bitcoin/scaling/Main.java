@@ -838,7 +838,8 @@ public class Main implements AutoCloseable {
                     if (reorgBlocksManifestJson.hasKey(blockHeight.toString())) {
                         final Json reorgBlockHashesJson = reorgBlocksManifestJson.get(blockHeight.toString());
                         for (int j = 0; j < reorgBlockHashesJson.length(); ++j) {
-                            final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
+                            final Sha256Hash reorgBlockHash = Sha256Hash.fromHexString(reorgBlockHashesJson.getString(j));
+                            final Block block = DiskUtil.loadBlock(reorgBlockHash, defaultScenarioDirectory);
                             final Boolean shouldWait = (i > 2);
                             _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
                         }
