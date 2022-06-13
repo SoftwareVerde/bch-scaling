@@ -268,7 +268,7 @@ public class Main implements AutoCloseable {
                 final long blockHeight = ( (initBlockCount - 1) + (createdBlockCount + 1) );
                 Logger.info("Height: " + blockHeight + " " + blockHash + " " + file.getPath() + " byteCount=" + blockDeflater.getByteCount(block));
 
-                _sendBlock(block, blockHeight, blocksDirectory, true);
+                _sendBlock(block, blockHeight, blocksDirectory, true, false);
 
                 if (newCreatedBlockCount >= blockCount) {
                     synchronized (createdBlocks) {
@@ -356,7 +356,7 @@ public class Main implements AutoCloseable {
         Logger.debug("Sent Header: " + blockHash);
     }
 
-    protected void _sendBlock(final Block block, final Long blockHeight, final File scenarioDirectory, final Boolean shouldWait) {
+    protected void _sendBlock(final Block block, final Long blockHeight, final File scenarioDirectory, final Boolean shouldWait, final Boolean shouldSendTransactionsIfPresent) {
         final Sha256Hash blockHash = block.getHash();
         // _currentBlockHash = blockHash;
 
@@ -368,7 +368,7 @@ public class Main implements AutoCloseable {
         if ( (blockHeight != null) && (PRE_RELAY_PERCENT > 0F) ) {
             final File directory = new File(scenarioDirectory, "mempool");
             final File file = new File(directory, blockHeight + ".sha");
-            if (file.exists()) {
+            if (file.exists() && shouldSendTransactionsIfPresent) {
                 final int blockTransactionCount = block.getTransactionCount();
                 final int transactionCount = (int) ((blockTransactionCount - 1) * PRE_RELAY_PERCENT);
                 final int seconds = (10 * 60);
@@ -554,7 +554,7 @@ public class Main implements AutoCloseable {
             initBlocks.add(block);
 
             if (! USE_P2P_BROADCAST) {
-                _sendBlock(block, null, null, false);
+                _sendBlock(block, null, null, false, false);
             }
         }
 
@@ -669,13 +669,13 @@ public class Main implements AutoCloseable {
         return blockHeaders;
     }
 
-    protected void _sendBlocks(final List<BlockHeader> scenarioBlocks, final Long runningBlockHeight, final File blockDirectory, final Boolean shouldWait) {
+    protected void _sendBlocks(final List<BlockHeader> scenarioBlocks, final Long runningBlockHeight, final File blockDirectory, final Boolean shouldWait, final Boolean shouldSendTransactionsIfPresent) {
         int i = 1;
         for (final BlockHeader blockHeader : scenarioBlocks) {
             final Sha256Hash blockHash = blockHeader.getHash();
             final Block block = DiskUtil.loadBlock(blockHash, blockDirectory);
             final Long blockHeight = (runningBlockHeight + i);
-            _sendBlock(block, blockHeight, blockDirectory, shouldWait);
+            _sendBlock(block, blockHeight, blockDirectory, shouldWait, shouldSendTransactionsIfPresent);
             i += 1;
         }
     }
@@ -835,22 +835,24 @@ public class Main implements AutoCloseable {
                     final Sha256Hash blockHash = Sha256Hash.fromHexString(blocksManifestJson.getString(i));
 
                     final Long blockHeight = (long) (initBlockCount + i);
-                    if (reorgBlocksManifestJson.hasKey(blockHeight.toString())) {
-                        final Json reorgBlockHashesJson = reorgBlocksManifestJson.get(blockHeight.toString());
+                    final String blockHeightString = blockHeight.toString();
+                    if (reorgBlocksManifestJson.hasKey(blockHeightString)) {
+                        final Json reorgBlockHashesJson = reorgBlocksManifestJson.get(blockHeightString);
                         for (int j = 0; j < reorgBlockHashesJson.length(); ++j) {
+                            final boolean isFirst = (j == 0);
                             final Sha256Hash reorgBlockHash = Sha256Hash.fromHexString(reorgBlockHashesJson.getString(j));
                             final Block block = DiskUtil.loadBlock(reorgBlockHash, defaultScenarioDirectory);
-                            final Boolean shouldWait = (i > 2);
-                            _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                            final boolean shouldWait = (i > 2);
+                            _sendBlock(block, blockHeight, defaultScenarioDirectory, (shouldWait && isFirst), isFirst);
                         }
 
                         final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
-                        _sendBlock(block, blockHeight, defaultScenarioDirectory, false); // Override shouldWait since it was reorged...
+                        _sendBlock(block, blockHeight, defaultScenarioDirectory, false, false); // Override shouldWait since it was reorged...
                     }
-                    else {
+                    else { // No orphan/reorg block...
                         final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
                         final Boolean shouldWait = (i > 2);
-                        _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait);
+                        _sendBlock(block, blockHeight, defaultScenarioDirectory, shouldWait, true);
                     }
                 }
 
@@ -869,7 +871,7 @@ public class Main implements AutoCloseable {
 
                     final Long blockHeight = (long) (initBlockCount + i);
                     final Block block = DiskUtil.loadBlock(blockHash, defaultScenarioDirectory);
-                    _sendBlock(block, blockHeight, defaultScenarioDirectory, true);
+                    _sendBlock(block, blockHeight, defaultScenarioDirectory, true, true);
 
                     final BlockHeader blockHeader = new ImmutableBlockHeader(block);
                     blockHeaders.add(blockHeader);
@@ -903,7 +905,7 @@ public class Main implements AutoCloseable {
         {
             final int targetNewBlockCount = coinbaseMaturityBlockCount;
             final MutableList<BlockHeader> scenarioBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
-            _sendBlocks(scenarioBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(scenarioBlocks, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - scenarioBlocks.getCount());
             scenarioBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, _calculateTimestamp(blockHeaders)));
             blockHeaders.addAll(scenarioBlocks);
@@ -919,7 +921,7 @@ public class Main implements AutoCloseable {
         {
             final int targetNewBlockCount = 10;
             final MutableList<BlockHeader> fanOutBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
-            _sendBlocks(fanOutBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(fanOutBlocks, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - fanOutBlocks.getCount());
             fanOutBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
@@ -984,7 +986,7 @@ public class Main implements AutoCloseable {
         {
             final int targetNewBlockCount = 5;
             final MutableList<BlockHeader> quasiSteadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
-            _sendBlocks(quasiSteadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(quasiSteadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocks.getCount());
             quasiSteadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
@@ -1047,7 +1049,7 @@ public class Main implements AutoCloseable {
         {
             final int targetNewBlockCount = 2;
             final MutableList<BlockHeader> fanInBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
-            _sendBlocks(fanInBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(fanInBlocks, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - fanInBlocks.getCount());
             fanInBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
@@ -1093,7 +1095,7 @@ public class Main implements AutoCloseable {
             final int targetNewBlockCount = 5;
             quasiSteadyStateBlocksRoundTwo = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
             Logger.debug("Loaded " + quasiSteadyStateBlocksRoundTwo.getCount() + " from manifest...");
-            _sendBlocks(quasiSteadyStateBlocksRoundTwo, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(quasiSteadyStateBlocksRoundTwo, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - quasiSteadyStateBlocksRoundTwo.getCount());
             quasiSteadyStateBlocksRoundTwo.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
@@ -1233,7 +1235,7 @@ public class Main implements AutoCloseable {
 
             final int targetNewBlockCount = 10;
             final MutableList<BlockHeader> steadyStateBlocks = _loadBlocksFromManifest(blocksManifestJson, runningBlockHeight, targetNewBlockCount, defaultScenarioDirectory);
-            _sendBlocks(steadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false);
+            _sendBlocks(steadyStateBlocks, runningBlockHeight, defaultScenarioDirectory, false, false);
             final int newBlockCount = (targetNewBlockCount - steadyStateBlocks.getCount());
             steadyStateBlocks.addAll(_generateBlocks(privateKeyGenerator, newBlockCount, defaultScenarioDirectory, blockHeaders, new TransactionGenerator() {
                 @Override
