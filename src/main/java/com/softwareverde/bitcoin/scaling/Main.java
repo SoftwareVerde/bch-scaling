@@ -46,10 +46,20 @@ public class Main implements AutoCloseable {
         Logger.setLogLevel("com.softwareverde.async.lock", LogLevel.WARN);
         Logger.setLogLevel("com.softwareverde.bitcoin.stratum.BitcoinCoreStratumServer", LogLevel.WARN);
         Logger.setLogLevel("com.softwareverde.bitcoin.wallet.Wallet", LogLevel.WARN);
+        _set_default_uncaught_exception_handler();
 
         try (final Main main = new Main()) {
             main.run();
         }
+    }
+
+    protected static void _set_default_uncaught_exception_handler() {
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread t, Throwable e) {
+                Logger.error("Uncaught exception from thread " + t.getName(), e);
+            }
+        });
     }
 
     public static Sha256Hash getBlockHash(final Long blockHeight, final List<BlockHeader> blockHeaders, final List<BlockHeader> newBlockHeaders) {
