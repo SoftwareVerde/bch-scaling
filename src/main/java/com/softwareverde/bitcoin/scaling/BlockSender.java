@@ -258,6 +258,7 @@ public class BlockSender {
     }
 
     public void transmitTestBlocks(MutableList<BlockHeader> blockHeaders, final int initBlockCount, final Json blocksManifestJson, final int manifestBlockCount, final Json reorgBlocksManifestJson, final File scenarioDirectory) {
+        final int lastEmptyBlockHeight = 244;
         if (_shouldUseP2PBroadcast) {
             _bitcoinNode.transmitBlockHeaders(blockHeaders);
             for (int i = 0; i < manifestBlockCount; ++i) {
@@ -269,7 +270,7 @@ public class BlockSender {
                     for (int j = 0; j < reorgBlockHashesJson.length(); ++j) {
                         final Sha256Hash reorgBlockHash = Sha256Hash.fromHexString(reorgBlockHashesJson.getString(j));
                         final Block block = DiskUtil.loadBlock(reorgBlockHash, scenarioDirectory);
-                        final Boolean shouldWait = (i > 2);
+                        final Boolean shouldWait = ((j == 0) && (blockHeight > lastEmptyBlockHeight)); // only wait for first block
                         this.sendBlock(block, blockHeight, scenarioDirectory, shouldWait);
                     }
 
@@ -278,7 +279,7 @@ public class BlockSender {
                 }
                 else {
                     final Block block = DiskUtil.loadBlock(blockHash, scenarioDirectory);
-                    final Boolean shouldWait = (i > 2);
+                    final Boolean shouldWait = (blockHeight > lastEmptyBlockHeight); // don't wait for genesis or empty setup blocks
                     this.sendBlock(block, blockHeight, scenarioDirectory, shouldWait);
                 }
             }
@@ -298,7 +299,8 @@ public class BlockSender {
 
                 final Long blockHeight = (long) (initBlockCount + i);
                 final Block block = DiskUtil.loadBlock(blockHash, scenarioDirectory);
-                this.sendBlock(block, blockHeight, scenarioDirectory, true);
+                final Boolean shouldWait = (blockHeight > lastEmptyBlockHeight); // don't wait for genesis or empty setup blocks
+                this.sendBlock(block, blockHeight, scenarioDirectory, shouldWait);
 
                 final BlockHeader blockHeader = new ImmutableBlockHeader(block);
                 blockHeaders.add(blockHeader);
